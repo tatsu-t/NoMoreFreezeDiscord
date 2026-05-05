@@ -1,7 +1,7 @@
 /**
  * @name Nomorefreezediscord
  * @author tatsu
- * @version 1.2.0
+ * @version 1.3.0
  * @description no more freeze for discord
  */
 
@@ -11,6 +11,7 @@ module.exports = class NoMoreFreezeDiscord {
         this.NAME = meta.name;
         this._timers  = new Map();
         this._pending = new Map();
+        this._settingsCache       = null;
         this.Dispatcher           = null;
         this.UserStore            = null;
         this.MessageAPI           = null;
@@ -18,6 +19,7 @@ module.exports = class NoMoreFreezeDiscord {
         this.GuildStore           = null;
         this.ChannelStore         = null;
         this.SelectedGuildStore   = null;
+        this.SelectedChannelStore = null;
         this._useDispatcher       = false;
         this._pendingNonces       = new Map();
         this._onMessageCreate = this._onMessageCreate.bind(this);
@@ -69,15 +71,26 @@ module.exports = class NoMoreFreezeDiscord {
     }
 
     get settings() {
+        return this._settingsCache ?? this._loadSettings();
+    }
+
+    _loadSettings() {
         const saved = BdApi.Data.load(this.NAME, "settings");
         const merged = Object.assign(this._defaultSettings(), saved ?? {});
         if (!merged.systemPrompt || merged.systemPrompt.trim() === "") {
             merged.systemPrompt = this._defaultSystemPrompt();
         }
-        return merged;
+        return this._sanitizeSettings(merged);
+    }
+
+    _sanitizeSettings(s) {
+        const delay = parseInt(s.deleteDelayMinutes, 10);
+        s.deleteDelayMinutes = (!isNaN(delay) && delay >= 1 && delay <= 10080) ? delay : 60;
+        return s;
     }
 
     _saveSettings(s) {
+        this._settingsCache = s;
         BdApi.Data.save(this.NAME, "settings", s);
     }
 
@@ -85,6 +98,7 @@ module.exports = class NoMoreFreezeDiscord {
     start() {
         try {
             this._resolveModules();
+            this._settingsCache = this._loadSettings();
             this._restorePending();
             this._subscribe();
             BdApi.UI.showToast(`[${this.NAME}] 起動しました`, { type: "success" });
@@ -129,14 +143,17 @@ module.exports = class NoMoreFreezeDiscord {
         this.GuildStore           = BdApi.Webpack.getByKeys("getGuild", "getGuilds");
         this.ChannelStore         = BdApi.Webpack.getByKeys("getChannel", "getDMFromUserId");
         this.SelectedGuildStore   = BdApi.Webpack.getByKeys("getGuildId", "getLastSelectedGuildId");
+        this.SelectedChannelStore = BdApi.Webpack.getByKeys("getChannelId", "getLastSelectedChannelId")
+            ?? BdApi.Webpack.getModule(m => typeof m?.getChannelId === "function" && typeof m?.getLastSelectedChannelId === "function");
 
-        if (!this.Dispatcher)           console.warn(`[${this.NAME}] Dispatcher not found`);
-        if (!this.UserStore)            console.warn(`[${this.NAME}] UserStore not found`);
-        if (!this.MessageAPI)           console.warn(`[${this.NAME}] MessageAPI not found`);
-        if (!this.SendAPI)              console.warn(`[${this.NAME}] SendAPI not found`);
-        if (!this.GuildStore)           console.warn(`[${this.NAME}] GuildStore not found`);
-        if (!this.ChannelStore)         console.warn(`[${this.NAME}] ChannelStore not found`);
-        if (!this.SelectedGuildStore)   console.warn(`[${this.NAME}] SelectedGuildStore not found`);
+        if (!this.Dispatcher)             console.warn(`[${this.NAME}] Dispatcher not found`);
+        if (!this.UserStore)              console.warn(`[${this.NAME}] UserStore not found`);
+        if (!this.MessageAPI)             console.warn(`[${this.NAME}] MessageAPI not found`);
+        if (!this.SendAPI)                console.warn(`[${this.NAME}] SendAPI not found`);
+        if (!this.GuildStore)             console.warn(`[${this.NAME}] GuildStore not found`);
+        if (!this.ChannelStore)           console.warn(`[${this.NAME}] ChannelStore not found`);
+        if (!this.SelectedGuildStore)     console.warn(`[${this.NAME}] SelectedGuildStore not found`);
+        if (!this.SelectedChannelStore)   console.warn(`[${this.NAME}] SelectedChannelStore not found`);
     }
 
     _subscribe() {
@@ -359,78 +376,35 @@ module.exports = class NoMoreFreezeDiscord {
 
     async _callAI(baseUrl, apiKey, model, content, systemPrompt) {
         try {
-            let res, data, text;
+            const path = baseUrl.includes("router.huggingface.co")
+                ? "/v1/chat/completions"
+                : "/chat/completions";
+            const endpoint = `${baseUrl}${path}`;
 
-            if (baseUrl.includes("api.groq.com")) {
-                res = await fetch(`${baseUrl}/chat/completions`, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${apiKey}`,
-                    },
-                    body: JSON.stringify({
-                        model,
-                        messages: [
-                            { role: "system", content: systemPrompt },
-                            { role: "user",   content },
-                        ],
-                        max_tokens: 1000,
-                        temperature: 0.0,
-                    }),
-                });
-                if (!res.ok) {
-                    const body = await res.text().catch(() => "");
-                    throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
-                }
-                data = await res.json();
-                text = (data.choices?.[0]?.message?.content ?? "").trim();
-            } else if (baseUrl.includes("router.huggingface.co")) {
-                res = await fetch(`${baseUrl}/v1/chat/completions`, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${apiKey}`,
-                    },
-                    body: JSON.stringify({
-                        model,
-                        messages: [
-                            { role: "system", content: systemPrompt },
-                            { role: "user",   content },
-                        ],
-                        max_tokens: 1000,
-                        temperature: 0.0,
-                    }),
-                });
-                if (!res.ok) {
-                    const body = await res.text().catch(() => "");
-                    throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
-                }
-                data = await res.json();
-                text = (data.choices?.[0]?.message?.content ?? "").trim();
-            } else {
-                res = await fetch(`${baseUrl}/chat/completions`, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${apiKey}`,
-                    },
-                    body: JSON.stringify({
-                        model,
-                        messages: [
-                            { role: "system", content: systemPrompt },
-                            { role: "user",   content },
-                        ],
-                        max_tokens: 1000,
-                        temperature: 0.0,
-                    }),
-                });
-                if (!res.ok) {
-                    const body = await res.text().catch(() => "");
-                    throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
-                }
-                data = await res.json();
-                text = (data.choices?.[0]?.message?.content ?? "").trim();
+            const res = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiKey}`,
+                },
+                body: JSON.stringify({
+                    model,
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user",   content },
+                    ],
+                    max_tokens: 1000,
+                    temperature: 0.0,
+                }),
+            });
+
+            if (!res.ok) {
+                const body = await res.text().catch(() => "");
+                throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
             }
+
+            const data = await res.json();
+            const text = (data.choices?.[0]?.message?.content ?? "").trim();
 
             const match = text.match(/\{[\s\S]*\}/);
             if (!match) {
@@ -504,8 +478,8 @@ module.exports = class NoMoreFreezeDiscord {
             this._pending.set(id, entry);
             const remaining = entry.deleteAt - Date.now();
             if (remaining <= 0) {
-                this._executeDelete(id, entry.channelId);
-            } else {
+                if (!this._timers.has(id)) this._executeDelete(id, entry.channelId);
+            } else if (!this._timers.has(id)) {
                 const tid = setTimeout(() => this._executeDelete(id, entry.channelId), remaining);
                 this._timers.set(id, tid);
                 console.log(`[${this.NAME}] Restored: ${id} fires in ${Math.round(remaining / 1000)}s`);
@@ -748,7 +722,7 @@ module.exports = class NoMoreFreezeDiscord {
             refreshDMList();
         });
         const currentDMBtn = makeButton("現在のDMを追加", "var(--button-secondary-background,#4f545c)", () => {
-            const channelId = self.SelectedGuildStore?.getLastSelectedGuildId?.();
+            const channelId = self.SelectedChannelStore?.getChannelId?.();
             if (!channelId) { BdApi.UI.showToast("チャンネルを開いた状態で操作してください", { type: "warn" }); return; }
             const ch = self.ChannelStore?.getChannel?.(channelId);
             if (!ch || (ch.type !== 1 && ch.type !== 3)) { BdApi.UI.showToast("現在のチャンネルはDMではありません", { type: "warn" }); return; }
