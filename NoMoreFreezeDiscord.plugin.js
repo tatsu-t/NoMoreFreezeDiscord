@@ -30,7 +30,7 @@ module.exports = class NoMoreFreezeDiscord {
             "あなたはDiscordの利用規約違反を検出するAIアシスタントです。\n\n" +
             "以下のカテゴリに該当するメッセージを厳格に判定してください：\n" +
             "- ハラスメント/脅迫\n" +
-            "- 未成年への性的コンテンツ（「ろり」「ロリ」等のワードを含むものは全て違反と判定）\n" +
+            "- 未成年への性的コンテンツ\n" +
             "- スパム/フィッシング\n" +
             "- 個人情報の無断公開\n" +
             "- 違法行為の促進\n" +
@@ -38,7 +38,8 @@ module.exports = class NoMoreFreezeDiscord {
             "- 過激主義の礼賛\n\n" +
             "判定ルール：\n" +
             "1. 「ろり」「ロリ」等のワードが含まれる場合は、必ず violation: true と判定してください\n" +
-            "2. その他のカテゴリについても厳格に判定してください\n\n" +
+            "2. 年齢に関するものは厳しく判定してください。(自身が未成年だと主張するものなど)\n\n" +
+            "3. その他のカテゴリについても厳格に判定してください\n\n" +
             "出力形式：\n" +
             "必ず以下のJSON形式のみで返答してください。他の説明や文章は一切含めないでください。\n" +
             '{"violation": true|false, "reason": "理由（日本語）"}\n\n' +
@@ -69,7 +70,11 @@ module.exports = class NoMoreFreezeDiscord {
 
     get settings() {
         const saved = BdApi.Data.load(this.NAME, "settings");
-        return Object.assign(this._defaultSettings(), saved ?? {});
+        const merged = Object.assign(this._defaultSettings(), saved ?? {});
+        if (!merged.systemPrompt || merged.systemPrompt.trim() === "") {
+            merged.systemPrompt = this._defaultSystemPrompt();
+        }
+        return merged;
     }
 
     _saveSettings(s) {
