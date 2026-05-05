@@ -4,3 +4,5 @@
 for better discord
 
 個人用だから適当
+
+MIT LICENSE
