@@ -524,13 +524,6 @@ module.exports = class NoMoreFreezeDiscord {
 
     _patchMessageComponent() {
         try {
-            const React = BdApi.React;
-            if (!React) {
-                console.warn(`[${this.NAME}] React not found, using DOM fallback`);
-                this._initDOMObserver();
-                return;
-            }
-
             const MessageContent = BdApi.Webpack.getModule(
                 e => !!e?.type?.toString()?.match(/SEND_FAILED.*SENDING|SENDING.*SEND_FAILED/)
             );
@@ -544,78 +537,46 @@ module.exports = class NoMoreFreezeDiscord {
                 e => e?.type?.toString()?.includes('message') && e?.type?.toString()?.includes('ListItem')
             );
 
-            const useStateConstant = {};
-            BdApi.Patcher.after(this.NAME, MessageContent, "type", (_, [props], ret) => {
-                if (!ret || !props?.message?.id) return;
+            const patchMessage = (component) => {
+                BdApi.Patcher.after(this.NAME, component, "type", (_, [props], ret) => {
+                    if (!ret || !props?.message?.id) return ret;
 
-                const [, forceUpdate] = React.useState(useStateConstant);
-                React.useEffect(() => {
-                    const callback = (e) => {
-                        if (!e || !e.messageId || e.messageId === props.message.id) {
-                            forceUpdate({});
+                    const messageId = props.message.id;
+                    const pending = this._pending?.has?.(messageId);
+                    const deleted = this._deletedMessages?.has?.(messageId);
+
+                    if (!pending && !deleted) return ret;
+
+                    const markerClass = deleted ? "nmf-deleted" : "nmf-pending";
+
+                    const markNode = (node) => {
+                        if (!node || typeof node !== "object") return;
+                        if (!node.props) node.props = {};
+                        const prev = node.props.className || "";
+                        if (!prev.includes(markerClass)) {
+                            node.props.className = `${prev} ${markerClass}`.trim();
                         }
                     };
-                    this.Dispatcher?.subscribe("NMF_FORCE_UPDATE", callback);
-                    return () => {
-                        this.Dispatcher?.unsubscribe("NMF_FORCE_UPDATE", callback);
+
+                    const walk = (node) => {
+                        if (!node) return;
+                        if (Array.isArray(node)) {
+                            node.forEach(walk);
+                            return;
+                        }
+                        markNode(node);
+                        const children = node?.props?.children;
+                        if (Array.isArray(children)) children.forEach(walk);
+                        else walk(children);
                     };
-                }, [props.message.id, forceUpdate]);
 
-                if (this._pending.has(props.message.id)) {
-                    const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
-                    if (message) {
-                        const existingClass = message.props.className || "";
-                        if (!existingClass.includes("nmf-pending")) {
-                            message.props.className = existingClass ? `${existingClass} nmf-pending` : "nmf-pending";
-                        }
-                    }
-                } else if (this._deletedMessages.has(props.message.id)) {
-                    const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
-                    if (message) {
-                        const existingClass = message.props.className || "";
-                        if (!existingClass.includes("nmf-deleted")) {
-                            message.props.className = existingClass ? `${existingClass} nmf-deleted` : "nmf-deleted";
-                        }
-                    }
-                }
-            });
-
-            if (MemoMessage) {
-                BdApi.Patcher.after(this.NAME, MemoMessage, "type", (_, [props], ret) => {
-                    if (!ret || !props?.message?.id) return;
-
-                    const [, forceUpdate] = React.useState(useStateConstant);
-                    React.useEffect(() => {
-                        const callback = (e) => {
-                            if (!e || !e.messageId || e.messageId === props.message.id) {
-                                forceUpdate({});
-                            }
-                        };
-                        this.Dispatcher?.subscribe("NMF_FORCE_UPDATE", callback);
-                        return () => {
-                            this.Dispatcher?.unsubscribe("NMF_FORCE_UPDATE", callback);
-                        };
-                    }, [props.message.id, forceUpdate]);
-
-                    if (this._pending.has(props.message.id)) {
-                        const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
-                        if (message) {
-                            const existingClass = message.props.className || "";
-                            if (!existingClass.includes("nmf-pending")) {
-                                message.props.className = existingClass ? `${existingClass} nmf-pending` : "nmf-pending";
-                            }
-                        }
-                    } else if (this._deletedMessages.has(props.message.id)) {
-                        const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
-                        if (message) {
-                            const existingClass = message.props.className || "";
-                            if (!existingClass.includes("nmf-deleted")) {
-                                message.props.className = existingClass ? `${existingClass} nmf-deleted` : "nmf-deleted";
-                            }
-                        }
-                    }
+                    walk(ret);
+                    return ret;
                 });
-            }
+            };
+
+            patchMessage(MessageContent);
+            if (MemoMessage) patchMessage(MemoMessage);
 
             console.log(`[${this.NAME}] MessageContent patched successfully`);
         } catch (e) {
@@ -624,39 +585,68 @@ module.exports = class NoMoreFreezeDiscord {
         }
     }
 
-    _findInReactTree(node, filter) {
-        if (!node) return null;
-        if (filter(node)) return node;
-        if (node.props?.children) {
-            const children = Array.isArray(node.props.children) ? node.props.children : [node.props.children];
-            for (const child of children) {
-                const found = this._findInReactTree(child, filter);
-                if (found) return found;
-            }
+    _dispatchRefresh(messageId) {
+        if (!this.Dispatcher) return;
+        this.Dispatcher.dispatch({
+            type: "NMF_STATE_CHANGED",
+            ids: [...this._pending.keys(), ...this._deletedMessages.keys()]
+        });
+        this._forceReactRefresh();
+    }
+
+    _forceReactRefresh() {
+        const chat = document.querySelector('[class*="chatContent"]');
+        if (!chat) return;
+
+        const reactKey = Object.keys(chat).find(k => k.startsWith("__reactProps") || k.startsWith("__reactFiber"));
+        if (!reactKey) return;
+
+        const fiber = chat[reactKey];
+        const instance = fiber?.return?.stateNode || fiber?.stateNode;
+        if (!instance) return;
+
+        if (typeof instance.forceUpdate === "function") {
+            instance.forceUpdate();
+            return;
         }
-        return null;
+
+        const root = instance?.setState ? instance : instance?.return?.stateNode;
+        root?.forceUpdate?.();
     }
 
     _initDOMObserver() {
-        if (this._domObserver) return;
+        if (this._domObserver) this._domObserver.disconnect();
+
         this._domObserver = new MutationObserver(() => {
-            for (const [id] of this._pending) {
-                const el = document.querySelector(`[data-list-item-id="${id}"]`);
-                if (el && !el.classList.contains("nmf-pending")) {
-                    el.classList.add("nmf-pending");
+            const nodes = document.querySelectorAll("[data-list-item-id]");
+            for (const el of nodes) {
+                const id = el.getAttribute("data-list-item-id");
+                if (!id) continue;
+                if (this._pending.has(id)) {
+                    if (!el.classList.contains("nmf-pending")) {
+                        el.classList.add("nmf-pending");
+                    }
+                } else {
+                    el.classList.remove("nmf-pending");
+                }
+                if (this._deletedMessages.has(id)) {
+                    if (!el.classList.contains("nmf-deleted")) {
+                        el.classList.add("nmf-deleted");
+                    }
+                } else {
+                    el.classList.remove("nmf-deleted");
                 }
             }
         });
-        this._domObserver.observe(document.body, { childList: true, subtree: true });
-    }
 
-    _dispatchRefresh(messageId) {
-        if (!this.Dispatcher) return;
-        this.Dispatcher.dispatch({ type: "NMF_FORCE_UPDATE", messageId });
+        this._domObserver.observe(document.body, { childList: true, subtree: true });
     }
 
     _onMessageDeleteTracker(e) {
         if (!e?.messageId) return;
+
+        // 自分のメッセージの削除のみ追跡
+        if (!this._pending.has(e.messageId)) return;
 
         const timerId = this._timers.get(e.messageId);
         if (timerId) clearTimeout(timerId);
@@ -665,11 +655,8 @@ module.exports = class NoMoreFreezeDiscord {
         this._pending.delete(e.messageId);
         this._savePending();
 
-        this._deletedMessages.set(e.messageId, Date.now());
-        this._dispatchRefresh(e.messageId);
-
         if (this.settings.debugLog) {
-            console.log(`[${this.NAME}] Message ${e.messageId} deleted, marked as deleted`);
+            console.log(`[${this.NAME}] Message ${e.messageId} manually deleted, schedule cancelled`);
         }
     }
 
