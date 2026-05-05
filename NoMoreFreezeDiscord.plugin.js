@@ -12,6 +12,7 @@ module.exports = class NoMoreFreezeDiscord {
         this._timers  = new Map();
         this._pending = new Map();
         this._settingsCache       = null;
+        this._domObserver         = null;
         this.Dispatcher           = null;
         this.UserStore            = null;
         this.MessageAPI           = null;
@@ -22,7 +23,9 @@ module.exports = class NoMoreFreezeDiscord {
         this.SelectedChannelStore = null;
         this._useDispatcher       = false;
         this._pendingNonces       = new Map();
-        this._onMessageCreate = this._onMessageCreate.bind(this);
+        this._onMessageCreate        = this._onMessageCreate.bind(this);
+        this._onMessageDeleteTracker = this._onMessageDeleteTracker.bind(this);
+        this._onMessageUpdateTracker = this._onMessageUpdateTracker.bind(this);
     }
 
     // ─── Settings ─────────────────────────────────────────────────────────────
@@ -99,6 +102,8 @@ module.exports = class NoMoreFreezeDiscord {
         try {
             this._resolveModules();
             this._settingsCache = this._loadSettings();
+            this._initStyles();
+            this._patchMessageComponent();
             this._restorePending();
             this._subscribe();
             BdApi.UI.showToast(`[${this.NAME}] 起動しました`, { type: "success" });
@@ -116,6 +121,10 @@ module.exports = class NoMoreFreezeDiscord {
             this._timers.clear();
         } catch (e) { console.error(`[${this.NAME}] timer clear error:`, e); }
         try { this._savePending(); } catch (e) { console.error(`[${this.NAME}] save pending error:`, e); }
+        try { BdApi.DOM.removeStyle(this.NAME + "-highlight"); } catch (e) { console.error(`[${this.NAME}] removeStyle error:`, e); }
+        try {
+            if (this._domObserver) { this._domObserver.disconnect(); this._domObserver = null; }
+        } catch (e) { console.error(`[${this.NAME}] domObserver disconnect error:`, e); }
     }
 
 
@@ -158,7 +167,9 @@ module.exports = class NoMoreFreezeDiscord {
 
     _subscribe() {
         if (this.Dispatcher) {
-            this.Dispatcher.subscribe("MESSAGE_CREATE", this._onMessageCreate);
+            this.Dispatcher.subscribe("MESSAGE_CREATE",  this._onMessageCreate);
+            this.Dispatcher.subscribe("MESSAGE_DELETE",  this._onMessageDeleteTracker);
+            this.Dispatcher.subscribe("MESSAGE_UPDATE",  this._onMessageUpdateTracker);
             this._useDispatcher = true;
         } else if (this.SendAPI) {
             this._patchSendMessage();
@@ -171,9 +182,12 @@ module.exports = class NoMoreFreezeDiscord {
     }
 
     _unsubscribe() {
-        if (this._useDispatcher && this.Dispatcher) {
+        if (!this.Dispatcher) return;
+        if (this._useDispatcher) {
             this.Dispatcher.unsubscribe("MESSAGE_CREATE", this._onMessageCreate);
         }
+        this.Dispatcher.unsubscribe("MESSAGE_DELETE", this._onMessageDeleteTracker);
+        this.Dispatcher.unsubscribe("MESSAGE_UPDATE", this._onMessageUpdateTracker);
     }
 
 
@@ -324,54 +338,53 @@ module.exports = class NoMoreFreezeDiscord {
         const s = this.settings;
         if (s.debugLog) console.log(`[${this.NAME}] Checking:`, msg.content.slice(0, 80));
 
-        let stage1 = null;
+        let result = null;
 
-        // Stage 1: Groq (メイン)
         if (s.groqApiKey) {
             try {
-                stage1 = await this._callAI(
+                result = await this._callAI(
                     "https://api.groq.com/openai/v1",
                     s.groqApiKey, s.groqModel, msg.content, s.systemPrompt
                 );
-                if (s.debugLog) console.log(`[${this.NAME}] Stage1 (Groq):`, stage1);
+                if (s.debugLog) console.log(`[${this.NAME}] Groq:`, result);
             } catch (e) {
                 console.warn(`[${this.NAME}] Groq API failed, trying Hugging Face:`, e);
             }
         }
 
-        // Stage 1: Hugging Face (フォールバック)
-        if (!stage1 && s.hfApiKey) {
+        if (!result && s.hfApiKey) {
             try {
-                stage1 = await this._callAI(
+                result = await this._callAI(
                     "https://router.huggingface.co",
                     s.hfApiKey, s.hfModel, msg.content, s.systemPrompt
                 );
-                if (s.debugLog) console.log(`[${this.NAME}] Stage1 (Hugging Face):`, stage1);
+                if (s.debugLog) console.log(`[${this.NAME}] Hugging Face:`, result);
             } catch (e) {
                 console.warn(`[${this.NAME}] Hugging Face API failed:`, e);
             }
         }
 
-        if (!stage1) {
+        if (!result) {
             console.warn(`[${this.NAME}] No AI API available — check skipped`);
             return;
         }
 
-        if (!stage1.violation) return;
+        if (!result.violation) return;
 
         if (!s.sakuraApiKey) {
             console.warn(`[${this.NAME}] Sakura API key not configured — confirmation skipped`);
+            this._scheduleDeletion(msg.id, msg.channel_id, msg.content, result.reason ?? "");
             return;
         }
 
-        const stage2 = await this._callAI(
+        const sakuraResult = await this._callAI(
             "https://api.ai.sakura.ad.jp/v1",
             s.sakuraApiKey, s.sakuraModel, msg.content, s.systemPrompt
         );
-        if (s.debugLog) console.log(`[${this.NAME}] Stage2 (Sakura):`, stage2);
-        if (!stage2.violation) return;
+        if (s.debugLog) console.log(`[${this.NAME}] Sakura:`, sakuraResult);
+        if (!sakuraResult.violation) return;
 
-        this._scheduleDeletion(msg.id, msg.channel_id, msg.content, stage2.reason ?? "");
+        this._scheduleDeletion(msg.id, msg.channel_id, msg.content, sakuraResult.reason ?? "");
     }
 
     async _callAI(baseUrl, apiKey, model, content, systemPrompt) {
@@ -437,6 +450,7 @@ module.exports = class NoMoreFreezeDiscord {
             s.deleteDelayMinutes * 60_000
         );
         this._timers.set(messageId, timerId);
+        this._dispatchRefresh(messageId);
 
         if (s.showToast) {
             BdApi.UI.showToast(
@@ -461,6 +475,7 @@ module.exports = class NoMoreFreezeDiscord {
             this._pending.delete(messageId);
             this._timers.delete(messageId);
             this._savePending();
+            this._dispatchRefresh(messageId);
         }
     }
 
@@ -484,6 +499,149 @@ module.exports = class NoMoreFreezeDiscord {
                 this._timers.set(id, tid);
                 console.log(`[${this.NAME}] Restored: ${id} fires in ${Math.round(remaining / 1000)}s`);
             }
+        }
+    }
+
+    _initStyles() {
+        BdApi.DOM.addStyle(this.NAME + "-highlight", `
+            html #app-mount .nmf-pending {
+                background-color: rgba(255, 165, 0, 0.15) !important;
+                border-left: 3px solid #ff9500 !important;
+            }
+            html #app-mount .nmf-pending:hover {
+                background-color: rgba(255, 165, 0, 0.25) !important;
+            }
+        `);
+    }
+
+    _patchMessageComponent() {
+        try {
+            const MessageContent = BdApi.Webpack.getModule(
+                e => !!e?.type?.toString()?.match(/SEND_FAILED.*SENDING|SENDING.*SEND_FAILED/)
+            );
+            if (!MessageContent) {
+                console.warn(`[${this.NAME}] MessageContent component not found, using DOM fallback`);
+                this._initDOMObserver();
+                return;
+            }
+
+            const useStateConstant = {};
+            BdApi.Patcher.after(this.NAME, MessageContent, "type", (_, [props], ret) => {
+                if (!ret || !props?.message?.id) return;
+
+                const forceUpdate = BdApi.React.useState(useStateConstant)[1];
+                BdApi.React.useEffect(
+                    () => {
+                        const callback = (e) => {
+                            if (!e || !e.messageId || e.messageId === props.message.id) {
+                                forceUpdate({});
+                            }
+                        };
+                        this.Dispatcher.subscribe("NMF_FORCE_UPDATE", callback);
+                        return () => {
+                            this.Dispatcher.unsubscribe("NMF_FORCE_UPDATE", callback);
+                        };
+                    },
+                    [props.message.id, forceUpdate]
+                );
+
+                if (this._pending.has(props.message.id)) {
+                    if (!ret.props) ret.props = {};
+                    const existingClass = ret.props.className || "";
+                    if (!existingClass.includes("nmf-pending")) {
+                        ret.props.className = existingClass ? `${existingClass} nmf-pending` : "nmf-pending";
+                    }
+                }
+            });
+            console.log(`[${this.NAME}] MessageContent patched successfully`);
+        } catch (e) {
+            console.warn(`[${this.NAME}] React patch failed, using DOM fallback:`, e);
+            this._initDOMObserver();
+        }
+    }
+
+    _initDOMObserver() {
+        if (this._domObserver) return;
+        this._domObserver = new MutationObserver(() => {
+            for (const [id] of this._pending) {
+                const el = document.querySelector(`[data-list-item-id="${id}"]`);
+                if (el && !el.classList.contains("nmf-pending")) {
+                    el.classList.add("nmf-pending");
+                }
+            }
+        });
+        this._domObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    _dispatchRefresh(messageId) {
+        if (!this.Dispatcher) return;
+        this.Dispatcher.dispatch({ type: "NMF_FORCE_UPDATE", messageId });
+    }
+
+    _onMessageDeleteTracker(e) {
+        if (!e?.messageId) return;
+        if (!this._pending.has(e.messageId)) return;
+
+        const timerId = this._timers.get(e.messageId);
+        if (timerId) clearTimeout(timerId);
+
+        this._timers.delete(e.messageId);
+        this._pending.delete(e.messageId);
+        this._savePending();
+
+        if (this.settings.debugLog) {
+            console.log(`[${this.NAME}] Message ${e.messageId} manually deleted, schedule cancelled`);
+        }
+    }
+
+    async _onMessageUpdateTracker(e) {
+        if (!e?.message?.id) return;
+        if (!this._pending.has(e.message.id)) return;
+
+        const s = this.settings;
+        let result = null;
+
+        if (s.groqApiKey) {
+            try {
+                result = await this._callAI(
+                    "https://api.groq.com/openai/v1",
+                    s.groqApiKey, s.groqModel, e.message.content, s.systemPrompt
+                );
+                if (s.debugLog) console.log(`[${this.NAME}] Edit recheck (Groq):`, result);
+            } catch (err) {
+                console.warn(`[${this.NAME}] Groq API failed for edit recheck, trying Hugging Face:`, err);
+            }
+        }
+
+        if (!result && s.hfApiKey) {
+            try {
+                result = await this._callAI(
+                    "https://router.huggingface.co",
+                    s.hfApiKey, s.hfModel, e.message.content, s.systemPrompt
+                );
+                if (s.debugLog) console.log(`[${this.NAME}] Edit recheck (Hugging Face):`, result);
+            } catch (err) {
+                console.warn(`[${this.NAME}] Hugging Face API failed for edit recheck:`, err);
+            }
+        }
+
+        if (!result) {
+            this._timers.delete(e.message.id);
+            this._pending.delete(e.message.id);
+            this._savePending();
+            this._dispatchRefresh(e.message.id);
+            if (s.debugLog) console.log(`[${this.NAME}] Message ${e.message.id} edited, schedule cancelled (no AI API)`);
+            return;
+        }
+
+        if (!result.violation) {
+            this._timers.delete(e.message.id);
+            this._pending.delete(e.message.id);
+            this._savePending();
+            this._dispatchRefresh(e.message.id);
+            if (s.debugLog) console.log(`[${this.NAME}] Message ${e.message.id} edited, schedule cancelled (no violation)`);
+        } else {
+            if (s.debugLog) console.log(`[${this.NAME}] Message ${e.message.id} edited, still violating`);
         }
     }
 
@@ -589,7 +747,7 @@ module.exports = class NoMoreFreezeDiscord {
         addPasswordInput("API Key", "groqApiKey");
         addTextInput("モデル", "groqModel", "llama3.1-8b-instant");
 
-        addHeader("Hugging Face API（前段フィルタ・フォールバック）");
+        addHeader("Hugging Face API（フォールバック）");
         addPasswordInput("API Key", "hfApiKey");
         addTextInput("モデル", "hfModel", "openai/gpt-oss-120b:fastest");
 
