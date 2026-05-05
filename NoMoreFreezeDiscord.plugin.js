@@ -11,6 +11,7 @@ module.exports = class NoMoreFreezeDiscord {
         this.NAME = meta.name;
         this._timers  = new Map();
         this._pending = new Map();
+        this._deletedMessages = new Map();
         this._settingsCache       = null;
         this._domObserver         = null;
         this.Dispatcher           = null;
@@ -511,11 +512,25 @@ module.exports = class NoMoreFreezeDiscord {
             html #app-mount .nmf-pending:hover {
                 background-color: rgba(255, 165, 0, 0.25) !important;
             }
+            html #app-mount .nmf-deleted {
+                background-color: rgba(240, 71, 71, 0.15) !important;
+                border-left: 3px solid #f04747 !important;
+            }
+            html #app-mount .nmf-deleted:hover {
+                background-color: rgba(240, 71, 71, 0.25) !important;
+            }
         `);
     }
 
     _patchMessageComponent() {
         try {
+            const React = BdApi.React;
+            if (!React) {
+                console.warn(`[${this.NAME}] React not found, using DOM fallback`);
+                this._initDOMObserver();
+                return;
+            }
+
             const MessageContent = BdApi.Webpack.getModule(
                 e => !!e?.type?.toString()?.match(/SEND_FAILED.*SENDING|SENDING.*SEND_FAILED/)
             );
@@ -525,39 +540,101 @@ module.exports = class NoMoreFreezeDiscord {
                 return;
             }
 
+            const MemoMessage = BdApi.Webpack.getModule(
+                e => e?.type?.toString()?.includes('message') && e?.type?.toString()?.includes('ListItem')
+            );
+
             const useStateConstant = {};
             BdApi.Patcher.after(this.NAME, MessageContent, "type", (_, [props], ret) => {
                 if (!ret || !props?.message?.id) return;
 
-                const forceUpdate = BdApi.React.useState(useStateConstant)[1];
-                BdApi.React.useEffect(
-                    () => {
+                const [, forceUpdate] = React.useState(useStateConstant);
+                React.useEffect(() => {
+                    const callback = (e) => {
+                        if (!e || !e.messageId || e.messageId === props.message.id) {
+                            forceUpdate({});
+                        }
+                    };
+                    this.Dispatcher?.subscribe("NMF_FORCE_UPDATE", callback);
+                    return () => {
+                        this.Dispatcher?.unsubscribe("NMF_FORCE_UPDATE", callback);
+                    };
+                }, [props.message.id, forceUpdate]);
+
+                if (this._pending.has(props.message.id)) {
+                    const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
+                    if (message) {
+                        const existingClass = message.props.className || "";
+                        if (!existingClass.includes("nmf-pending")) {
+                            message.props.className = existingClass ? `${existingClass} nmf-pending` : "nmf-pending";
+                        }
+                    }
+                } else if (this._deletedMessages.has(props.message.id)) {
+                    const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
+                    if (message) {
+                        const existingClass = message.props.className || "";
+                        if (!existingClass.includes("nmf-deleted")) {
+                            message.props.className = existingClass ? `${existingClass} nmf-deleted` : "nmf-deleted";
+                        }
+                    }
+                }
+            });
+
+            if (MemoMessage) {
+                BdApi.Patcher.after(this.NAME, MemoMessage, "type", (_, [props], ret) => {
+                    if (!ret || !props?.message?.id) return;
+
+                    const [, forceUpdate] = React.useState(useStateConstant);
+                    React.useEffect(() => {
                         const callback = (e) => {
                             if (!e || !e.messageId || e.messageId === props.message.id) {
                                 forceUpdate({});
                             }
                         };
-                        this.Dispatcher.subscribe("NMF_FORCE_UPDATE", callback);
+                        this.Dispatcher?.subscribe("NMF_FORCE_UPDATE", callback);
                         return () => {
-                            this.Dispatcher.unsubscribe("NMF_FORCE_UPDATE", callback);
+                            this.Dispatcher?.unsubscribe("NMF_FORCE_UPDATE", callback);
                         };
-                    },
-                    [props.message.id, forceUpdate]
-                );
+                    }, [props.message.id, forceUpdate]);
 
-                if (this._pending.has(props.message.id)) {
-                    if (!ret.props) ret.props = {};
-                    const existingClass = ret.props.className || "";
-                    if (!existingClass.includes("nmf-pending")) {
-                        ret.props.className = existingClass ? `${existingClass} nmf-pending` : "nmf-pending";
+                    if (this._pending.has(props.message.id)) {
+                        const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
+                        if (message) {
+                            const existingClass = message.props.className || "";
+                            if (!existingClass.includes("nmf-pending")) {
+                                message.props.className = existingClass ? `${existingClass} nmf-pending` : "nmf-pending";
+                            }
+                        }
+                    } else if (this._deletedMessages.has(props.message.id)) {
+                        const message = this._findInReactTree(ret, e => e && typeof e?.props?.className === 'string');
+                        if (message) {
+                            const existingClass = message.props.className || "";
+                            if (!existingClass.includes("nmf-deleted")) {
+                                message.props.className = existingClass ? `${existingClass} nmf-deleted` : "nmf-deleted";
+                            }
+                        }
                     }
-                }
-            });
+                });
+            }
+
             console.log(`[${this.NAME}] MessageContent patched successfully`);
         } catch (e) {
             console.warn(`[${this.NAME}] React patch failed, using DOM fallback:`, e);
             this._initDOMObserver();
         }
+    }
+
+    _findInReactTree(node, filter) {
+        if (!node) return null;
+        if (filter(node)) return node;
+        if (node.props?.children) {
+            const children = Array.isArray(node.props.children) ? node.props.children : [node.props.children];
+            for (const child of children) {
+                const found = this._findInReactTree(child, filter);
+                if (found) return found;
+            }
+        }
+        return null;
     }
 
     _initDOMObserver() {
@@ -580,7 +657,6 @@ module.exports = class NoMoreFreezeDiscord {
 
     _onMessageDeleteTracker(e) {
         if (!e?.messageId) return;
-        if (!this._pending.has(e.messageId)) return;
 
         const timerId = this._timers.get(e.messageId);
         if (timerId) clearTimeout(timerId);
@@ -589,8 +665,11 @@ module.exports = class NoMoreFreezeDiscord {
         this._pending.delete(e.messageId);
         this._savePending();
 
+        this._deletedMessages.set(e.messageId, Date.now());
+        this._dispatchRefresh(e.messageId);
+
         if (this.settings.debugLog) {
-            console.log(`[${this.NAME}] Message ${e.messageId} manually deleted, schedule cancelled`);
+            console.log(`[${this.NAME}] Message ${e.messageId} deleted, marked as deleted`);
         }
     }
 
