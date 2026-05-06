@@ -486,7 +486,8 @@ module.exports = class NoMoreFreezeDiscord {
         console.log(`[${this.NAME}] Scheduled: ${messageId} in ${s.deleteDelayMinutes}min — ${reason}`);
     }
 
-    async _executeDelete(messageId, channelId) {
+    async _executeDelete(messageId, channelId, retryCount = 0) {
+        const MAX_RETRIES = 3;
         try {
             if (this.MessageAPI?.deleteMessage) {
                 this.MessageAPI.deleteMessage(channelId, messageId);
@@ -495,7 +496,17 @@ module.exports = class NoMoreFreezeDiscord {
                 console.error(`[${this.NAME}] MessageAPI unavailable — cannot delete ${messageId}`);
             }
         } catch (e) {
-            console.error(`[${this.NAME}] Delete failed for ${messageId}:`, e);
+            const status = e?.status ?? e?.statusCode;
+            const isRetryable = !status || (status >= 500 && status < 600) || status === 429;
+
+            if (isRetryable && retryCount < MAX_RETRIES) {
+                console.warn(`[${this.NAME}] Delete failed for ${messageId} (retry ${retryCount + 1}/${MAX_RETRIES}), retrying in 30s:`, e);
+                const retryTimer = setTimeout(() => this._executeDelete(messageId, channelId, retryCount + 1), 30000);
+                this._timers.set(messageId, retryTimer);
+                return;
+            }
+
+            console.error(`[${this.NAME}] Delete failed for ${messageId} (non-retryable or max retries reached):`, e);
         } finally {
             this._pending.delete(messageId);
             this._timers.delete(messageId);
@@ -535,13 +546,6 @@ module.exports = class NoMoreFreezeDiscord {
             }
             html #app-mount .nmf-pending:hover {
                 background-color: rgba(255, 165, 0, 0.25) !important;
-            }
-            html #app-mount .nmf-deleted {
-                background-color: rgba(240, 71, 71, 0.15) !important;
-                border-left: 3px solid #f04747 !important;
-            }
-            html #app-mount .nmf-deleted:hover {
-                background-color: rgba(240, 71, 71, 0.25) !important;
             }
         `);
     }
@@ -923,8 +927,6 @@ module.exports = class NoMoreFreezeDiscord {
     }
 
     _onMessageDeleteTracker(e) {
-        console.log(`[${this.NAME}] MESSAGE_DELETE event (all):`, e);
-
         const messageId = e?.messageId ?? e?.id;
         if (!messageId) {
             if (this.settings.debugLog) {
