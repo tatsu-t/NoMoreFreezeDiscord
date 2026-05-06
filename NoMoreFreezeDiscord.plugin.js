@@ -33,25 +33,31 @@ module.exports = class NoMoreFreezeDiscord {
 
     _defaultSystemPrompt() {
         return (
-            "あなたはDiscordの利用規約違反を検出するAIアシスタントです。\n\n" +
-            "以下のカテゴリに該当するメッセージを厳格に判定してください：\n" +
-            "- ハラスメント/脅迫\n" +
-            "- 未成年への性的コンテンツ\n" +
-            "- スパム/フィッシング\n" +
-            "- 個人情報の無断公開\n" +
-            "- 違法行為の促進\n" +
-            "- ヘイトスピーチ\n" +
-            "- 過激主義の礼賛\n\n" +
-            "判定ルール：\n" +
-            "1. 「ろり」「ロリ」等のワードが含まれる場合は、必ず violation: true と判定してください。\n" +
-            "2. 年齢に関するものは厳しく判定してください。(自身が未成年だと主張するものなど)\n\n" +
-            "3. その他のカテゴリについても厳格に判定してください。\n\n" +
-            "出力形式：\n" +
-            "必ず以下のJSON形式のみで返答してください。他の説明や文章は一切含めないでください。\n" +
-            '{"violation": true|false, "reason": "理由（日本語）"}\n\n' +
-            "例：\n" +
-            '{"violation": true, "reason": "未成年への性的コンテンツに該当"}\n' +
-            '{"violation": false, "reason": "規約違反なし"}'
+            "You are a strict content moderator for Discord messages. " +
+            "Detect messages that violate Discord's Terms of Service.\n\n" +
+            "Violation categories:\n" +
+            "- Harassment or threats\n" +
+            "- Sexual content involving minors\n" +
+            "- Spam or phishing\n" +
+            "- Doxxing (sharing private info without consent)\n" +
+            "- Promotion of illegal activity\n" +
+            "- Hate speech\n" +
+            "- Glorification of extremism\n\n" +
+            "STRICT RULES:\n" +
+            "1. If the message contains 'ろり', 'ロリ', 'loli', or similar terms, ALWAYS return violation: true.\n" +
+            "2. Age-related content must be judged strictly (especially claims of being a minor).\n" +
+            "3. Messages may be in Japanese, English, or mixed. Judge content meaning, not language.\n" +
+            "4. Do NOT flag normal conversation, jokes, or harmless content.\n\n" +
+            "OUTPUT FORMAT (CRITICAL):\n" +
+            "Respond with ONLY a single JSON object. No markdown, no code blocks, no explanation.\n" +
+            '{"violation": true|false, "reason": "<brief reason in Japanese>"}\n\n' +
+            "Examples:\n" +
+            'Input: "ろりこんです"\n' +
+            'Output: {"violation": true, "reason": "未成年への性的な言及"}\n\n' +
+            'Input: "今日は良い天気だね"\n' +
+            'Output: {"violation": false, "reason": "規約違反なし"}\n\n' +
+            'Input: "死ね"\n' +
+            'Output: {"violation": true, "reason": "ハラスメント・脅迫"}'
         );
     }
 
@@ -80,7 +86,8 @@ module.exports = class NoMoreFreezeDiscord {
 
     _loadSettings() {
         const saved = BdApi.Data.load(this.NAME, "settings");
-        const merged = Object.assign(this._defaultSettings(), saved ?? {});
+        const merged = Object.assign({}, this._defaultSettings(), saved ?? {});
+        // systemPromptが空の場合はデフォルトを再代入
         if (!merged.systemPrompt || merged.systemPrompt.trim() === "") {
             merged.systemPrompt = this._defaultSystemPrompt();
         }
@@ -105,6 +112,7 @@ module.exports = class NoMoreFreezeDiscord {
             this._settingsCache = this._loadSettings();
             this._initStyles();
             this._patchMessageComponent();
+            this._patchContextMenu();
             this._restorePending();
             this._subscribe();
             BdApi.UI.showToast(`[${this.NAME}] 起動しました`, { type: "success" });
@@ -131,6 +139,7 @@ module.exports = class NoMoreFreezeDiscord {
 
     _resolveModules() {
         this.Dispatcher =
+            BdApi.Webpack.getByKeys('_dispatcher')?._dispatcher ??
             BdApi.Webpack.getByKeys("dispatch", "subscribe", "isDispatching") ??
             BdApi.Webpack.getByKeys("dispatch", "subscribe", "waitFor") ??
             BdApi.Webpack.getByKeys("dispatch", "subscribe", "unsubscribe") ??
@@ -168,10 +177,44 @@ module.exports = class NoMoreFreezeDiscord {
 
     _subscribe() {
         if (this.Dispatcher) {
+            console.log(`[${this.NAME}] Dispatcher found, subscribing to events`);
+
+            // FluxDispatcher に存在するイベント名を全列挙
+            try {
+                const subscriptions = this.Dispatcher._subscriptions;
+                const actionHandlers = this.Dispatcher._actionHandlers?._dependencyGraph?.nodes;
+                console.log(`[${this.NAME}] Available events in Dispatcher:`);
+                console.log(`[${this.NAME}] _subscriptions:`, Object.keys(subscriptions || {}));
+                console.log(`[${this.NAME}] _actionHandlers nodes:`, Object.keys(actionHandlers || {}));
+            } catch (e) {
+                console.warn(`[${this.NAME}] Failed to list Dispatcher events:`, e);
+            }
+
             this.Dispatcher.subscribe("MESSAGE_CREATE",  this._onMessageCreate);
-            this.Dispatcher.subscribe("MESSAGE_DELETE",  this._onMessageDeleteTracker);
             this.Dispatcher.subscribe("MESSAGE_UPDATE",  this._onMessageUpdateTracker);
             this._useDispatcher = true;
+
+            // MESSAGE_DELETE は before patch で確実に捕捉
+            // (他プラグインがイベント伝播を止めていても動く)
+            BdApi.Patcher.before(this.NAME, this.Dispatcher, "dispatch", (_, [event]) => {
+                if (event?.type === "MESSAGE_DELETE") {
+                    this._onMessageDeleteTracker(event);
+                }
+                if (event?.type === "MESSAGE_DELETE_BULK") {
+                    const ids = event.ids ?? [];
+                    for (const id of ids) {
+                        this._onMessageDeleteTracker({ messageId: id });
+                    }
+                }
+            });
+
+            // テスト用: すべてのイベントをログに出す
+            this.Dispatcher.subscribe("MESSAGE_DELETE", (e) => {
+                console.log(`[${this.NAME}] MESSAGE_DELETE (test):`, e);
+            });
+            this.Dispatcher.subscribe("MESSAGE_DELETE_BULK", (e) => {
+                console.log(`[${this.NAME}] MESSAGE_DELETE_BULK (test):`, e);
+            });
         } else if (this.SendAPI) {
             this._patchSendMessage();
             this._useDispatcher = false;
@@ -395,26 +438,30 @@ module.exports = class NoMoreFreezeDiscord {
                 : "/chat/completions";
             const endpoint = `${baseUrl}${path}`;
 
+            const isGroq = baseUrl.includes("groq.com");
+            const body = {
+                model,
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user",   content },
+                ],
+                max_tokens: 300,
+                temperature: 0.0,
+            };
+            if (isGroq) body.response_format = { type: "json_object" };
+
             const res = await fetch(endpoint, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                     "Authorization": `Bearer ${apiKey}`,
                 },
-                body: JSON.stringify({
-                    model,
-                    messages: [
-                        { role: "system", content: systemPrompt },
-                        { role: "user",   content },
-                    ],
-                    max_tokens: 1000,
-                    temperature: 0.0,
-                }),
+                body: JSON.stringify(body),
             });
 
             if (!res.ok) {
-                const body = await res.text().catch(() => "");
-                throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+                const bodyText = await res.text().catch(() => "");
+                throw new Error(`HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
             }
 
             const data = await res.json();
@@ -586,77 +633,351 @@ module.exports = class NoMoreFreezeDiscord {
     }
 
     _dispatchRefresh(messageId) {
-        if (!this.Dispatcher) return;
-        this.Dispatcher.dispatch({
-            type: "NMF_STATE_CHANGED",
-            ids: [...this._pending.keys(), ...this._deletedMessages.keys()]
-        });
+        // Reactへの通知 (試みる)
         this._forceReactRefresh();
+        // DOM直接適用 (確実)
+        this._applyDOMHighlights();
     }
 
     _forceReactRefresh() {
-        const chat = document.querySelector('[class*="chatContent"]');
-        if (!chat) return;
+        // メッセージリストのコンテナを複数のセレクタで探す
+        const selectors = [
+            '[class*="chatContent"]',
+            '[class*="messagesWrapper"]',
+            '[class*="scroller"]',
+        ];
 
-        const reactKey = Object.keys(chat).find(k => k.startsWith("__reactProps") || k.startsWith("__reactFiber"));
-        if (!reactKey) return;
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
 
-        const fiber = chat[reactKey];
-        const instance = fiber?.return?.stateNode || fiber?.stateNode;
-        if (!instance) return;
+            // __reactFiber または __reactProps を探す
+            const fiberKey = Object.keys(el).find(k =>
+                k.startsWith("__reactFiber") || k.startsWith("__reactInternalInstance")
+            );
+            if (!fiberKey) continue;
 
-        if (typeof instance.forceUpdate === "function") {
-            instance.forceUpdate();
-            return;
+            let fiber = el[fiberKey];
+            // fiber を上にたどって forceUpdate できるインスタンスを探す
+            let tries = 0;
+            while (fiber && tries++ < 50) {
+                const inst = fiber.stateNode;
+                if (inst && typeof inst.forceUpdate === "function") {
+                    inst.forceUpdate();
+                    return;
+                }
+                fiber = fiber.return;
+            }
         }
 
-        const root = instance?.setState ? instance : instance?.return?.stateNode;
-        root?.forceUpdate?.();
+        // fallback: DOMObserver で直接クラスを付ける
+        this._applyDOMHighlights();
+    }
+
+    // 新規追加: DOM に直接クラスを適用するメソッド
+    _applyDOMHighlights() {
+        // 複数のセレクタを試す
+        const selectors = [
+            '[id^="chat-messages-"]',
+            '[data-list-item-id]',
+            '[data-message-id]',
+            '[class*="message"]',
+        ];
+
+        for (const sel of selectors) {
+            const messageEls = document.querySelectorAll(sel);
+            if (messageEls.length === 0) continue;
+
+            for (const el of messageEls) {
+                let msgId = null;
+
+                // IDからメッセージIDを抽出
+                if (el.id && el.id.startsWith("chat-messages-")) {
+                    const parts = el.id.split("-");
+                    msgId = parts[parts.length - 1];
+                }
+                // data-list-item-idから抽出
+                else if (el.dataset.listItemId) {
+                    msgId = el.dataset.listItemId;
+                }
+                // data-message-idから抽出
+                else if (el.dataset.messageId) {
+                    msgId = el.dataset.messageId;
+                }
+
+                if (!msgId) continue;
+
+                el.classList.toggle("nmf-pending", this._pending.has(msgId));
+                el.classList.toggle("nmf-deleted", this._deletedMessages.has(msgId));
+            }
+
+            // 少なくとも1つのセレクタで見つかったら終了
+            if (messageEls.length > 0) {
+                console.log(`[${this.NAME}] Applied highlights using selector: ${sel}, found ${messageEls.length} elements`);
+                return;
+            }
+        }
+
+        console.log(`[${this.NAME}] No message elements found for highlighting`);
     }
 
     _initDOMObserver() {
         if (this._domObserver) this._domObserver.disconnect();
 
-        this._domObserver = new MutationObserver(() => {
-            const nodes = document.querySelectorAll("[data-list-item-id]");
-            for (const el of nodes) {
-                const id = el.getAttribute("data-list-item-id");
-                if (!id) continue;
-                if (this._pending.has(id)) {
-                    if (!el.classList.contains("nmf-pending")) {
-                        el.classList.add("nmf-pending");
-                    }
-                } else {
-                    el.classList.remove("nmf-pending");
-                }
-                if (this._deletedMessages.has(id)) {
-                    if (!el.classList.contains("nmf-deleted")) {
-                        el.classList.add("nmf-deleted");
-                    }
-                } else {
-                    el.classList.remove("nmf-deleted");
-                }
+        const applyHighlights = () => {
+            // [data-list-item-id] ではなく [id^="chat-messages-"] を使う
+            const messageEls = document.querySelectorAll('[id^="chat-messages-"]');
+            for (const el of messageEls) {
+                const parts = el.id.split("-");
+                const msgId = parts[parts.length - 1];
+                el.classList.toggle("nmf-pending", this._pending.has(msgId));
+                el.classList.toggle("nmf-deleted", this._deletedMessages.has(msgId));
             }
-        });
+        };
 
+        this._domObserver = new MutationObserver(applyHighlights);
         this._domObserver.observe(document.body, { childList: true, subtree: true });
     }
 
+    _patchContextMenu() {
+        try {
+            const self = this;
+
+            // Message context menu - cancel tracking option
+            const MESSAGE_MENU_IDS = ["message", "message-context"];
+
+            for (const menuId of MESSAGE_MENU_IDS) {
+                BdApi.ContextMenu.patch(menuId, (tree, props) => {
+                    const messageId = props?.message?.id ?? props?.messageId;
+                    if (!messageId) return;
+                    if (!this._pending.has(messageId)) return;
+
+                    const cancelItem = BdApi.ContextMenu.buildItem({
+                        type: "text",
+                        label: "追跡を停止",
+                        danger: true,
+                        onClick: () => {
+                            const timerId = this._timers.get(messageId);
+                            if (timerId) clearTimeout(timerId);
+                            this._timers.delete(messageId);
+                            this._pending.delete(messageId);
+                            this._savePending();
+                            this._dispatchRefresh(messageId);
+                            BdApi.UI.showToast("追跡を停止しました", { type: "success" });
+                        }
+                    });
+
+                    // children の構造に依存しない安全な追加方法
+                    const pushToMenu = (node) => {
+                        if (!node) return;
+                        if (Array.isArray(node)) {
+                            node.push(BdApi.ContextMenu.buildItem({ type: "separator" }), cancelItem);
+                            return;
+                        }
+                        if (node?.props?.children) {
+                            pushToMenu(node.props.children);
+                        }
+                    };
+                    pushToMenu(tree?.props?.children);
+                });
+            }
+
+            // Guild context menu - server exclude/allow
+            BdApi.ContextMenu.patch("guild-context", (tree, props) => {
+                if (!props?.guild) return;
+
+                const guildId = props.guild.id;
+                const s = this.settings;
+                const isBlacklisted = s.serverBlacklist.includes(guildId);
+
+                const separator = BdApi.ContextMenu.buildItem({
+                    type: "separator"
+                });
+
+                const toggleItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isBlacklisted ? "サーバー除外を解除" : "サーバーを除外",
+                    onClick: () => {
+                        if (isBlacklisted) {
+                            s.serverBlacklist = s.serverBlacklist.filter(id => id !== guildId);
+                            BdApi.UI.showToast(`${this._getGuildName(guildId)} の除外を解除しました`, { type: "success" });
+                        } else {
+                            s.serverBlacklist = [...s.serverBlacklist, guildId];
+                            BdApi.UI.showToast(`${this._getGuildName(guildId)} を除外しました`, { type: "success" });
+                        }
+                        this._saveSettings(s);
+                    }
+                });
+
+                tree.props.children.push(separator, toggleItem);
+            });
+
+            // Channel context menu - channel exclude/allow
+            BdApi.ContextMenu.patch("channel-context", (tree, props) => {
+                if (!props?.channel) return;
+
+                const channelId = props.channel.id;
+                const s = this.settings;
+                const isBlacklisted = s.channelBlacklist.includes(channelId);
+                const isWhitelisted = s.channelWhitelist.includes(channelId);
+
+                const separator = BdApi.ContextMenu.buildItem({
+                    type: "separator"
+                });
+
+                const blacklistItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isBlacklisted ? "チャンネル除外を解除" : "チャンネルを除外",
+                    onClick: () => {
+                        if (isBlacklisted) {
+                            s.channelBlacklist = s.channelBlacklist.filter(id => id !== channelId);
+                            BdApi.UI.showToast(`${this._getChannelName(channelId)} の除外を解除しました`, { type: "success" });
+                        } else {
+                            s.channelBlacklist = [...s.channelBlacklist, channelId];
+                            BdApi.UI.showToast(`${this._getChannelName(channelId)} を除外しました`, { type: "success" });
+                        }
+                        this._saveSettings(s);
+                    }
+                });
+
+                const whitelistItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isWhitelisted ? "チャンネル許可を解除" : "チャンネルを許可",
+                    onClick: () => {
+                        if (isWhitelisted) {
+                            s.channelWhitelist = s.channelWhitelist.filter(id => id !== channelId);
+                            BdApi.UI.showToast(`${this._getChannelName(channelId)} の許可を解除しました`, { type: "success" });
+                        } else {
+                            s.channelWhitelist = [...s.channelWhitelist, channelId];
+                            BdApi.UI.showToast(`${this._getChannelName(channelId)} を許可しました`, { type: "success" });
+                        }
+                        this._saveSettings(s);
+                    }
+                });
+
+                tree.props.children.push(separator, blacklistItem, whitelistItem);
+            });
+
+            // User context menu - DM allow
+            BdApi.ContextMenu.patch("user-context", (tree, props) => {
+                if (!props?.user) return;
+
+                const userId = props.user.id;
+                const s = this.settings;
+
+                // Check if this user has a DM channel in whitelist
+                const dmChannelId = this._getDMChannelId(userId);
+                if (!dmChannelId) return;
+
+                const isWhitelisted = s.dmWhitelist.includes(dmChannelId);
+
+                const separator = BdApi.ContextMenu.buildItem({
+                    type: "separator"
+                });
+
+                const toggleItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isWhitelisted ? "DM許可を解除" : "DMを許可",
+                    onClick: () => {
+                        if (isWhitelisted) {
+                            s.dmWhitelist = s.dmWhitelist.filter(id => id !== dmChannelId);
+                            BdApi.UI.showToast(`${this._getDMName(dmChannelId)} の許可を解除しました`, { type: "success" });
+                        } else {
+                            s.dmWhitelist = [...s.dmWhitelist, dmChannelId];
+                            BdApi.UI.showToast(`${this._getDMName(dmChannelId)} を許可しました`, { type: "success" });
+                        }
+                        this._saveSettings(s);
+                    }
+                });
+
+                tree.props.children.push(separator, toggleItem);
+            });
+
+            // GDM context menu (Group DM)
+            BdApi.ContextMenu.patch("gdm-context", (tree, props) => {
+                if (!props?.channel) return;
+
+                const channelId = props.channel.id;
+                const s = this.settings;
+                const isWhitelisted = s.dmWhitelist.includes(channelId);
+
+                const separator = BdApi.ContextMenu.buildItem({
+                    type: "separator"
+                });
+
+                const toggleItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isWhitelisted ? "DM許可を解除" : "DMを許可",
+                    onClick: () => {
+                        if (isWhitelisted) {
+                            s.dmWhitelist = s.dmWhitelist.filter(id => id !== channelId);
+                            BdApi.UI.showToast(`${this._getDMName(channelId)} の許可を解除しました`, { type: "success" });
+                        } else {
+                            s.dmWhitelist = [...s.dmWhitelist, channelId];
+                            BdApi.UI.showToast(`${this._getDMName(channelId)} を許可しました`, { type: "success" });
+                        }
+                        this._saveSettings(s);
+                    }
+                });
+
+                tree.props.children.push(separator, toggleItem);
+            });
+
+            console.log(`[${this.NAME}] ContextMenu patched successfully`);
+        } catch (e) {
+            console.warn(`[${this.NAME}] ContextMenu patch failed:`, e);
+        }
+    }
+
+    _getDMChannelId(userId) {
+        try {
+            const me = this.UserStore?.getCurrentUser();
+            if (!me) return null;
+
+            const dmChannels = this.ChannelStore?.getDMUserIds?.();
+            if (!dmChannels) return null;
+
+            for (const [channelId, userIds] of Object.entries(dmChannels)) {
+                if (userIds.includes(userId) && userIds.includes(me.id)) {
+                    return channelId;
+                }
+            }
+            return null;
+        } catch (e) {
+            console.error(`[${this.NAME}] _getDMChannelId error:`, e);
+            return null;
+        }
+    }
+
     _onMessageDeleteTracker(e) {
-        if (!e?.messageId) return;
+        console.log(`[${this.NAME}] MESSAGE_DELETE event (all):`, e);
+
+        const messageId = e?.messageId ?? e?.id;
+        if (!messageId) {
+            if (this.settings.debugLog) {
+                console.log(`[${this.NAME}] MESSAGE_DELETE: no messageId`);
+            }
+            return;
+        }
 
         // 自分のメッセージの削除のみ追跡
-        if (!this._pending.has(e.messageId)) return;
+        if (!this._pending.has(messageId)) {
+            if (this.settings.debugLog) {
+                console.log(`[${this.NAME}] MESSAGE_DELETE: ${messageId} not in pending`);
+            }
+            return;
+        }
 
-        const timerId = this._timers.get(e.messageId);
+        const timerId = this._timers.get(messageId);
         if (timerId) clearTimeout(timerId);
 
-        this._timers.delete(e.messageId);
-        this._pending.delete(e.messageId);
+        this._timers.delete(messageId);
+        this._pending.delete(messageId);
         this._savePending();
+        this._dispatchRefresh(messageId);
 
         if (this.settings.debugLog) {
-            console.log(`[${this.NAME}] Message ${e.messageId} manually deleted, schedule cancelled`);
+            console.log(`[${this.NAME}] Message ${messageId} manually deleted, schedule cancelled`);
         }
     }
 
