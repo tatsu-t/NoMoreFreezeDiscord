@@ -1,7 +1,7 @@
 /**
  * @name Nomorefreezediscord
  * @author tatsu
- * @version 1.3.0
+ * @version 1.4.0
  * @description no more freeze for discord
  */
 
@@ -212,6 +212,14 @@ module.exports = class NoMoreFreezeDiscord {
     }
 
 
+    _trimPendingNonces() {
+        // メモリリーク予防: 100件超で古いものから削除
+        while (this._pendingNonces.size > 100) {
+            const oldest = this._pendingNonces.keys().next().value;
+            this._pendingNonces.delete(oldest);
+        }
+    }
+
     _patchSendMessage() {
         BdApi.Patcher.after(this.NAME, this.SendAPI, "sendMessage", (that, args, result) => {
             try {
@@ -228,7 +236,7 @@ module.exports = class NoMoreFreezeDiscord {
                     result.then(res => {
                         const msgId = res?.body?.id ?? res?.id ?? res?.message?.id;
                         if (msgId) {
-                            console.log(`[${this.NAME}] Patcher: got message ID ${msgId}`);
+                            if (this.settings.debugLog) console.log(`[${this.NAME}] Patcher: got message ID ${msgId}`);
                             const me = this.UserStore?.getCurrentUser();
                             const ch = this.ChannelStore?.getChannel(channelId);
                             const msg = {
@@ -243,10 +251,12 @@ module.exports = class NoMoreFreezeDiscord {
                             }
                         } else if (nonce) {
                             this._pendingNonces.set(nonce, { channelId, content: msgContent });
+                            this._trimPendingNonces();
                         }
                     }).catch(e => console.error(`[${this.NAME}] Patcher: sendMessage promise error:`, e));
                 } else if (nonce) {
                     this._pendingNonces.set(nonce, { channelId, content: msgContent });
+                    this._trimPendingNonces();
                 }
             } catch (e) {
                 console.error(`[${this.NAME}] Patcher: sendMessage patch error:`, e);
@@ -337,7 +347,7 @@ module.exports = class NoMoreFreezeDiscord {
                 if (this._pendingNonces.has(key)) {
                     const { channelId, content } = this._pendingNonces.get(key);
                     this._pendingNonces.delete(key);
-                    console.log(`[${this.NAME}] Nonce match: scheduling deletion for ${msg.id}`);
+                    if (s.debugLog) console.log(`[${this.NAME}] Nonce match: scheduling deletion for ${msg.id}`);
                     this._analyzeMessage({ ...msg, content }).catch(e => console.error(`[${this.NAME}] analyzeMessage error:`, e));
                     return;
                 }
@@ -483,7 +493,105 @@ module.exports = class NoMoreFreezeDiscord {
                 { type: "warning", timeout: 8000 }
             );
         }
-        console.log(`[${this.NAME}] Scheduled: ${messageId} in ${s.deleteDelayMinutes}min — ${reason}`);
+        if (s.debugLog) console.log(`[${this.NAME}] Scheduled: ${messageId} in ${s.deleteDelayMinutes}min — ${reason}`);
+    }
+
+    _scheduleManualDeletion(messageId, channelId, delayMinutes) {
+        if (this._pending.has(messageId)) {
+            BdApi.UI.showToast("このメッセージは既に追跡中です", { type: "info" });
+            return;
+        }
+
+        const delay = parseInt(delayMinutes, 10);
+        if (isNaN(delay) || delay < 1 || delay > 10080) {
+            BdApi.UI.showToast("無効な時間です（1〜10080分）", { type: "error" });
+            return;
+        }
+
+        const deleteAt = Date.now() + delay * 60_000;
+        this._pending.set(messageId, {
+            channelId,
+            deleteAt,
+            content: "(手動スケジュール)",
+            reason: "手動指定",
+        });
+        this._savePending();
+
+        const timerId = setTimeout(
+            () => this._executeDelete(messageId, channelId),
+            delay * 60_000
+        );
+        this._timers.set(messageId, timerId);
+
+        this._dispatchRefresh(messageId);
+        if (this.settings.showToast) {
+            BdApi.UI.showToast(`${delay}分後に削除予定`, { type: "success" });
+        }
+    }
+
+    _showCustomTimeDialog(messageId, channelId) {
+        const React = BdApi.React;
+        const { useState } = React;
+
+        // 入力値を保持する変数（onConfirm から最新値を読むためのクロージャ）
+        let currentValue = 60;
+
+        const InputComponent = () => {
+            const [value, setValue] = useState(60);
+            currentValue = value;
+
+            return React.createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: "8px" } },
+                React.createElement(
+                    "div",
+                    { style: { color: "var(--text-normal)", fontSize: "14px" } },
+                    "何分後に削除しますか？（1〜10080分）"
+                ),
+                React.createElement("input", {
+                    type: "number",
+                    min: 1,
+                    max: 10080,
+                    value: value,
+                    autoFocus: true,
+                    onChange: (e) => {
+                        const raw = e.target.value;
+                        if (raw === "") { setValue(""); return; }
+                        const v = parseInt(raw, 10);
+                        setValue(isNaN(v) ? "" : v);
+                    },
+                    style: {
+                        width: "100%",
+                        padding: "6px 8px",
+                        background: "var(--input-background)",
+                        border: "1px solid var(--input-border)",
+                        borderRadius: "4px",
+                        color: "var(--text-normal)",
+                        fontSize: "13px",
+                        boxSizing: "border-box",
+                    },
+                })
+            );
+        };
+
+        BdApi.UI.showConfirmationModal(
+            "カスタム時間で削除",
+            React.createElement(InputComponent),
+            {
+                confirmText: "スケジュール設定",
+                cancelText: "キャンセル",
+                onConfirm: () => {
+                    // 空欄ならデフォルト60分にフォールバック（モーダル再表示の手間を省く）
+                    const raw = (currentValue === "" || currentValue == null) ? 60 : currentValue;
+                    const minutes = parseInt(raw, 10);
+                    if (isNaN(minutes) || minutes < 1 || minutes > 10080) {
+                        BdApi.UI.showToast("無効な時間です（1〜10080分）", { type: "error" });
+                        return;
+                    }
+                    this._scheduleManualDeletion(messageId, channelId, minutes);
+                },
+            }
+        );
     }
 
     async _executeDelete(messageId, channelId, retryCount = 0) {
@@ -491,7 +599,7 @@ module.exports = class NoMoreFreezeDiscord {
         try {
             if (this.MessageAPI?.deleteMessage) {
                 this.MessageAPI.deleteMessage(channelId, messageId);
-                console.log(`[${this.NAME}] Deleted: ${messageId}`);
+                if (this.settings.debugLog) console.log(`[${this.NAME}] Deleted: ${messageId}`);
             } else {
                 console.error(`[${this.NAME}] MessageAPI unavailable — cannot delete ${messageId}`);
             }
@@ -501,18 +609,19 @@ module.exports = class NoMoreFreezeDiscord {
 
             if (isRetryable && retryCount < MAX_RETRIES) {
                 console.warn(`[${this.NAME}] Delete failed for ${messageId} (retry ${retryCount + 1}/${MAX_RETRIES}), retrying in 30s:`, e);
+                // リトライ予約: _pending は維持する（finally で消すと次回参照できなくなる）
                 const retryTimer = setTimeout(() => this._executeDelete(messageId, channelId, retryCount + 1), 30000);
                 this._timers.set(messageId, retryTimer);
                 return;
             }
 
             console.error(`[${this.NAME}] Delete failed for ${messageId} (non-retryable or max retries reached):`, e);
-        } finally {
-            this._pending.delete(messageId);
-            this._timers.delete(messageId);
-            this._savePending();
-            this._dispatchRefresh(messageId);
         }
+        // 成功 or リトライ不可の最終失敗時のみクリーンアップ
+        this._pending.delete(messageId);
+        this._timers.delete(messageId);
+        this._savePending();
+        this._dispatchRefresh(messageId);
     }
 
     _savePending() {
@@ -533,7 +642,7 @@ module.exports = class NoMoreFreezeDiscord {
             } else if (!this._timers.has(id)) {
                 const tid = setTimeout(() => this._executeDelete(id, entry.channelId), remaining);
                 this._timers.set(id, tid);
-                console.log(`[${this.NAME}] Restored: ${id} fires in ${Math.round(remaining / 1000)}s`);
+                if (this.settings.debugLog) console.log(`[${this.NAME}] Restored: ${id} fires in ${Math.round(remaining / 1000)}s`);
             }
         }
     }
@@ -605,7 +714,7 @@ module.exports = class NoMoreFreezeDiscord {
             patchMessage(MessageContent);
             if (MemoMessage) patchMessage(MemoMessage);
 
-            console.log(`[${this.NAME}] MessageContent patched successfully`);
+            if (this.settings.debugLog) console.log(`[${this.NAME}] MessageContent patched successfully`);
         } catch (e) {
             console.warn(`[${this.NAME}] React patch failed, using DOM fallback:`, e);
             this._initDOMObserver();
@@ -692,12 +801,12 @@ module.exports = class NoMoreFreezeDiscord {
 
             // 少なくとも1つのセレクタで見つかったら終了
             if (messageEls.length > 0) {
-                console.log(`[${this.NAME}] Applied highlights using selector: ${sel}, found ${messageEls.length} elements`);
+                if (this.settings.debugLog) console.log(`[${this.NAME}] Applied highlights using selector: ${sel}, found ${messageEls.length} elements`);
                 return;
             }
         }
 
-        console.log(`[${this.NAME}] No message elements found for highlighting`);
+        if (this.settings.debugLog) console.log(`[${this.NAME}] No message elements found for highlighting`);
     }
 
     _initDOMObserver() {
@@ -726,29 +835,73 @@ module.exports = class NoMoreFreezeDiscord {
             for (const menuId of MESSAGE_MENU_IDS) {
                 BdApi.ContextMenu.patch(menuId, (tree, props) => {
                     const messageId = props?.message?.id ?? props?.messageId;
-                    if (!messageId) return;
-                    if (!this._pending.has(messageId)) return;
+                    const channelId = props?.message?.channel_id ?? props?.channel?.id;
+                    if (!messageId || !channelId) return;
 
-                    const cancelItem = BdApi.ContextMenu.buildItem({
+                    // 自分のメッセージのみサブメニューを表示
+                    const me = this.UserStore?.getCurrentUser();
+                    const authorId = props?.message?.author?.id;
+                    if (!me || !authorId || authorId !== me.id) return;
+
+                    const isPending = this._pending.has(messageId);
+
+                    // プリセット時間オプション
+                    const presets = [
+                        { label: "5分後に削除", minutes: 5 },
+                        { label: "15分後に削除", minutes: 15 },
+                        { label: "30分後に削除", minutes: 30 },
+                        { label: "1時間後に削除", minutes: 60 },
+                    ];
+
+                    const presetItems = presets.map(p => BdApi.ContextMenu.buildItem({
                         type: "text",
-                        label: "追跡を停止",
-                        danger: true,
-                        onClick: () => {
-                            const timerId = this._timers.get(messageId);
-                            if (timerId) clearTimeout(timerId);
-                            this._timers.delete(messageId);
-                            this._pending.delete(messageId);
-                            this._savePending();
-                            this._dispatchRefresh(messageId);
-                            BdApi.UI.showToast("追跡を停止しました", { type: "success" });
-                        }
+                        label: p.label,
+                        disabled: isPending,
+                        onClick: () => this._scheduleManualDeletion(messageId, channelId, p.minutes),
+                    }));
+
+                    const customItem = BdApi.ContextMenu.buildItem({
+                        type: "text",
+                        label: "カスタム時間で削除...",
+                        disabled: isPending,
+                        onClick: () => this._showCustomTimeDialog(messageId, channelId),
                     });
 
-                    // children の構造に依存しない安全な追加方法
+                    const children = [
+                        ...presetItems,
+                        BdApi.ContextMenu.buildItem({ type: "separator" }),
+                        customItem,
+                    ];
+
+                    // 追跡中なら「追跡を解除」を追加
+                    if (isPending) {
+                        children.push(BdApi.ContextMenu.buildItem({ type: "separator" }));
+                        children.push(BdApi.ContextMenu.buildItem({
+                            type: "text",
+                            label: "追跡を解除",
+                            danger: true,
+                            onClick: () => {
+                                const timerId = this._timers.get(messageId);
+                                if (timerId) clearTimeout(timerId);
+                                this._timers.delete(messageId);
+                                this._pending.delete(messageId);
+                                this._savePending();
+                                this._dispatchRefresh(messageId);
+                                BdApi.UI.showToast("追跡を停止しました", { type: "success" });
+                            },
+                        }));
+                    }
+
+                    const submenu = BdApi.ContextMenu.buildItem({
+                        type: "submenu",
+                        label: "NoMoreFreeze",
+                        children,
+                    });
+
                     const pushToMenu = (node) => {
                         if (!node) return;
                         if (Array.isArray(node)) {
-                            node.push(BdApi.ContextMenu.buildItem({ type: "separator" }), cancelItem);
+                            node.push(BdApi.ContextMenu.buildItem({ type: "separator" }), submenu);
                             return;
                         }
                         if (node?.props?.children) {
@@ -767,10 +920,6 @@ module.exports = class NoMoreFreezeDiscord {
                 const s = this.settings;
                 const isBlacklisted = s.serverBlacklist.includes(guildId);
 
-                const separator = BdApi.ContextMenu.buildItem({
-                    type: "separator"
-                });
-
                 const toggleItem = BdApi.ContextMenu.buildItem({
                     type: "text",
                     label: isBlacklisted ? "サーバー除外を解除" : "サーバーを除外",
@@ -786,7 +935,23 @@ module.exports = class NoMoreFreezeDiscord {
                     }
                 });
 
-                tree.props.children.push(separator, toggleItem);
+                const submenu = BdApi.ContextMenu.buildItem({
+                    type: "submenu",
+                    label: "NoMoreFreeze",
+                    children: [toggleItem],
+                });
+
+                const pushToMenu = (node) => {
+                    if (!node) return;
+                    if (Array.isArray(node)) {
+                        node.push(BdApi.ContextMenu.buildItem({ type: "separator" }), submenu);
+                        return;
+                    }
+                    if (node?.props?.children) {
+                        pushToMenu(node.props.children);
+                    }
+                };
+                pushToMenu(tree?.props?.children);
             });
 
             // Channel context menu - channel exclude/allow
@@ -797,10 +962,6 @@ module.exports = class NoMoreFreezeDiscord {
                 const s = this.settings;
                 const isBlacklisted = s.channelBlacklist.includes(channelId);
                 const isWhitelisted = s.channelWhitelist.includes(channelId);
-
-                const separator = BdApi.ContextMenu.buildItem({
-                    type: "separator"
-                });
 
                 const blacklistItem = BdApi.ContextMenu.buildItem({
                     type: "text",
@@ -832,7 +993,23 @@ module.exports = class NoMoreFreezeDiscord {
                     }
                 });
 
-                tree.props.children.push(separator, blacklistItem, whitelistItem);
+                const submenu = BdApi.ContextMenu.buildItem({
+                    type: "submenu",
+                    label: "NoMoreFreeze",
+                    children: [blacklistItem, whitelistItem],
+                });
+
+                const pushToMenu = (node) => {
+                    if (!node) return;
+                    if (Array.isArray(node)) {
+                        node.push(BdApi.ContextMenu.buildItem({ type: "separator" }), submenu);
+                        return;
+                    }
+                    if (node?.props?.children) {
+                        pushToMenu(node.props.children);
+                    }
+                };
+                pushToMenu(tree?.props?.children);
             });
 
             // User context menu - DM allow
@@ -844,10 +1021,6 @@ module.exports = class NoMoreFreezeDiscord {
 
                 const dmChannelId = this._getDMChannelId(userId);
                 const isWhitelisted = dmChannelId && s.dmWhitelist.includes(dmChannelId);
-
-                const separator = BdApi.ContextMenu.buildItem({
-                    type: "separator"
-                });
 
                 const toggleItem = BdApi.ContextMenu.buildItem({
                     type: "text",
@@ -866,7 +1039,23 @@ module.exports = class NoMoreFreezeDiscord {
                     }
                 });
 
-                tree.props.children.push(separator, toggleItem);
+                const submenu = BdApi.ContextMenu.buildItem({
+                    type: "submenu",
+                    label: "NoMoreFreeze",
+                    children: [toggleItem],
+                });
+
+                const pushToMenu = (node) => {
+                    if (!node) return;
+                    if (Array.isArray(node)) {
+                        node.push(BdApi.ContextMenu.buildItem({ type: "separator" }), submenu);
+                        return;
+                    }
+                    if (node?.props?.children) {
+                        pushToMenu(node.props.children);
+                    }
+                };
+                pushToMenu(tree?.props?.children);
             });
 
             // GDM context menu (Group DM)
@@ -876,10 +1065,6 @@ module.exports = class NoMoreFreezeDiscord {
                 const channelId = props.channel.id;
                 const s = this.settings;
                 const isWhitelisted = s.dmWhitelist.includes(channelId);
-
-                const separator = BdApi.ContextMenu.buildItem({
-                    type: "separator"
-                });
 
                 const toggleItem = BdApi.ContextMenu.buildItem({
                     type: "text",
@@ -896,10 +1081,26 @@ module.exports = class NoMoreFreezeDiscord {
                     }
                 });
 
-                tree.props.children.push(separator, toggleItem);
+                const submenu = BdApi.ContextMenu.buildItem({
+                    type: "submenu",
+                    label: "NoMoreFreeze",
+                    children: [toggleItem],
+                });
+
+                const pushToMenu = (node) => {
+                    if (!node) return;
+                    if (Array.isArray(node)) {
+                        node.push(BdApi.ContextMenu.buildItem({ type: "separator" }), submenu);
+                        return;
+                    }
+                    if (node?.props?.children) {
+                        pushToMenu(node.props.children);
+                    }
+                };
+                pushToMenu(tree?.props?.children);
             });
 
-            console.log(`[${this.NAME}] ContextMenu patched successfully`);
+            if (this.settings.debugLog) console.log(`[${this.NAME}] ContextMenu patched successfully`);
         } catch (e) {
             console.warn(`[${this.NAME}] ContextMenu patch failed:`, e);
         }
@@ -988,11 +1189,8 @@ module.exports = class NoMoreFreezeDiscord {
         }
 
         if (!result) {
-            this._timers.delete(e.message.id);
-            this._pending.delete(e.message.id);
-            this._savePending();
-            this._dispatchRefresh(e.message.id);
-            if (s.debugLog) console.log(`[${this.NAME}] Message ${e.message.id} edited, schedule cancelled (no AI API)`);
+            // AI 一時障害ではスケジュールを維持（違反内容を残したまま編集して逃げるのを防ぐ）
+            if (s.debugLog) console.log(`[${this.NAME}] Message ${e.message.id} edited, AI recheck failed — keeping schedule`);
             return;
         }
 
