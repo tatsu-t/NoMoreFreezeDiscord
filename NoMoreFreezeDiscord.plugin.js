@@ -11,7 +11,6 @@ module.exports = class NoMoreFreezeDiscord {
         this.NAME = meta.name;
         this._timers  = new Map();
         this._pending = new Map();
-        this._deletedMessages = new Map();
         this._settingsCache       = null;
         this._domObserver         = null;
         this.Dispatcher           = null;
@@ -177,19 +176,6 @@ module.exports = class NoMoreFreezeDiscord {
 
     _subscribe() {
         if (this.Dispatcher) {
-            console.log(`[${this.NAME}] Dispatcher found, subscribing to events`);
-
-            // FluxDispatcher に存在するイベント名を全列挙
-            try {
-                const subscriptions = this.Dispatcher._subscriptions;
-                const actionHandlers = this.Dispatcher._actionHandlers?._dependencyGraph?.nodes;
-                console.log(`[${this.NAME}] Available events in Dispatcher:`);
-                console.log(`[${this.NAME}] _subscriptions:`, Object.keys(subscriptions || {}));
-                console.log(`[${this.NAME}] _actionHandlers nodes:`, Object.keys(actionHandlers || {}));
-            } catch (e) {
-                console.warn(`[${this.NAME}] Failed to list Dispatcher events:`, e);
-            }
-
             this.Dispatcher.subscribe("MESSAGE_CREATE",  this._onMessageCreate);
             this.Dispatcher.subscribe("MESSAGE_UPDATE",  this._onMessageUpdateTracker);
             this._useDispatcher = true;
@@ -207,14 +193,6 @@ module.exports = class NoMoreFreezeDiscord {
                     }
                 }
             });
-
-            // テスト用: すべてのイベントをログに出す
-            this.Dispatcher.subscribe("MESSAGE_DELETE", (e) => {
-                console.log(`[${this.NAME}] MESSAGE_DELETE (test):`, e);
-            });
-            this.Dispatcher.subscribe("MESSAGE_DELETE_BULK", (e) => {
-                console.log(`[${this.NAME}] MESSAGE_DELETE_BULK (test):`, e);
-            });
         } else if (this.SendAPI) {
             this._patchSendMessage();
             this._useDispatcher = false;
@@ -229,9 +207,8 @@ module.exports = class NoMoreFreezeDiscord {
         if (!this.Dispatcher) return;
         if (this._useDispatcher) {
             this.Dispatcher.unsubscribe("MESSAGE_CREATE", this._onMessageCreate);
+            this.Dispatcher.unsubscribe("MESSAGE_UPDATE", this._onMessageUpdateTracker);
         }
-        this.Dispatcher.unsubscribe("MESSAGE_DELETE", this._onMessageDeleteTracker);
-        this.Dispatcher.unsubscribe("MESSAGE_UPDATE", this._onMessageUpdateTracker);
     }
 
 
@@ -590,11 +567,10 @@ module.exports = class NoMoreFreezeDiscord {
 
                     const messageId = props.message.id;
                     const pending = this._pending?.has?.(messageId);
-                    const deleted = this._deletedMessages?.has?.(messageId);
 
-                    if (!pending && !deleted) return ret;
+                    if (!pending) return ret;
 
-                    const markerClass = deleted ? "nmf-deleted" : "nmf-pending";
+                    const markerClass = "nmf-pending";
 
                     const markNode = (node) => {
                         if (!node || typeof node !== "object") return;
@@ -708,7 +684,6 @@ module.exports = class NoMoreFreezeDiscord {
                 if (!msgId) continue;
 
                 el.classList.toggle("nmf-pending", this._pending.has(msgId));
-                el.classList.toggle("nmf-deleted", this._deletedMessages.has(msgId));
             }
 
             // 少なくとも1つのセレクタで見つかったら終了
@@ -725,13 +700,11 @@ module.exports = class NoMoreFreezeDiscord {
         if (this._domObserver) this._domObserver.disconnect();
 
         const applyHighlights = () => {
-            // [data-list-item-id] ではなく [id^="chat-messages-"] を使う
             const messageEls = document.querySelectorAll('[id^="chat-messages-"]');
             for (const el of messageEls) {
                 const parts = el.id.split("-");
                 const msgId = parts[parts.length - 1];
                 el.classList.toggle("nmf-pending", this._pending.has(msgId));
-                el.classList.toggle("nmf-deleted", this._deletedMessages.has(msgId));
             }
         };
 
@@ -865,11 +838,8 @@ module.exports = class NoMoreFreezeDiscord {
                 const userId = props.user.id;
                 const s = this.settings;
 
-                // Check if this user has a DM channel in whitelist
                 const dmChannelId = this._getDMChannelId(userId);
-                if (!dmChannelId) return;
-
-                const isWhitelisted = s.dmWhitelist.includes(dmChannelId);
+                const isWhitelisted = dmChannelId && s.dmWhitelist.includes(dmChannelId);
 
                 const separator = BdApi.ContextMenu.buildItem({
                     type: "separator"
@@ -878,7 +848,9 @@ module.exports = class NoMoreFreezeDiscord {
                 const toggleItem = BdApi.ContextMenu.buildItem({
                     type: "text",
                     label: isWhitelisted ? "DM許可を解除" : "DMを許可",
+                    disabled: !dmChannelId,
                     onClick: () => {
+                        if (!dmChannelId) return;
                         if (isWhitelisted) {
                             s.dmWhitelist = s.dmWhitelist.filter(id => id !== dmChannelId);
                             BdApi.UI.showToast(`${this._getDMName(dmChannelId)} の許可を解除しました`, { type: "success" });
@@ -938,7 +910,8 @@ module.exports = class NoMoreFreezeDiscord {
             if (!dmChannels) return null;
 
             for (const [channelId, userIds] of Object.entries(dmChannels)) {
-                if (userIds.includes(userId) && userIds.includes(me.id)) {
+                const ids = Array.isArray(userIds) ? userIds : [userIds];
+                if (ids.includes(userId) && ids.includes(me.id)) {
                     return channelId;
                 }
             }
