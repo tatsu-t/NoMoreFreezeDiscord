@@ -1,7 +1,7 @@
 /**
  * @name Nomorefreezediscord
  * @author tatsu
- * @version 1.4.0
+ * @version 1.7.0
  * @description no more freeze for discord
  */
 
@@ -23,6 +23,7 @@ module.exports = class NoMoreFreezeDiscord {
         this.SelectedChannelStore = null;
         this._useDispatcher       = false;
         this._pendingNonces       = new Map();
+        this._knownLocalNonces    = new Set();
         this._onMessageCreate        = this._onMessageCreate.bind(this);
         this._onMessageDeleteTracker = this._onMessageDeleteTracker.bind(this);
         this._onMessageUpdateTracker = this._onMessageUpdateTracker.bind(this);
@@ -72,6 +73,13 @@ module.exports = class NoMoreFreezeDiscord {
             systemPrompt: this._defaultSystemPrompt(),
             showToast: true,
             debugLog: false,
+            autoRemoveEnabled: false,
+            autoRemoveDelayMinutes: 60,
+            autoRemoveCrossDevice: true,
+            autoRemoveCrossDeviceNonceLimit: 200,
+            autoRemoveServers: [],
+            autoRemoveChannels: [],
+            autoRemoveDMs: [],
             serverBlacklist: [],
             channelBlacklist: [],
             channelWhitelist: [],
@@ -96,6 +104,17 @@ module.exports = class NoMoreFreezeDiscord {
     _sanitizeSettings(s) {
         const delay = parseInt(s.deleteDelayMinutes, 10);
         s.deleteDelayMinutes = (!isNaN(delay) && delay >= 1 && delay <= 10080) ? delay : 60;
+
+        const autoDelay = parseInt(s.autoRemoveDelayMinutes, 10);
+        s.autoRemoveDelayMinutes = (!isNaN(autoDelay) && autoDelay >= 1 && autoDelay <= 10080) ? autoDelay : 60;
+
+        const nonceLimit = parseInt(s.autoRemoveCrossDeviceNonceLimit, 10);
+        s.autoRemoveCrossDeviceNonceLimit = (!isNaN(nonceLimit) && nonceLimit >= 50 && nonceLimit <= 1000) ? nonceLimit : 200;
+
+        for (const key of ["autoRemoveServers", "autoRemoveChannels", "autoRemoveDMs"]) {
+            if (!Array.isArray(s[key])) s[key] = [];
+        }
+
         return s;
     }
 
@@ -127,6 +146,7 @@ module.exports = class NoMoreFreezeDiscord {
         try {
             this._timers.forEach(id => clearTimeout(id));
             this._timers.clear();
+            this._knownLocalNonces?.clear();
         } catch (e) { console.error(`[${this.NAME}] timer clear error:`, e); }
         try { this._savePending(); } catch (e) { console.error(`[${this.NAME}] save pending error:`, e); }
         try { BdApi.DOM.removeStyle(this.NAME + "-highlight"); } catch (e) { console.error(`[${this.NAME}] removeStyle error:`, e); }
@@ -193,6 +213,11 @@ module.exports = class NoMoreFreezeDiscord {
                     }
                 }
             });
+
+            // Dispatcher経路でも自端末送信を識別するためにnonceを記録
+            if (this.SendAPI) {
+                this._patchSendMessageForNonceTracking();
+            }
         } else if (this.SendAPI) {
             this._patchSendMessage();
             this._useDispatcher = false;
@@ -218,6 +243,49 @@ module.exports = class NoMoreFreezeDiscord {
             const oldest = this._pendingNonces.keys().next().value;
             this._pendingNonces.delete(oldest);
         }
+    }
+
+    _trimKnownLocalNonces() {
+        const limit = this.settings.autoRemoveCrossDeviceNonceLimit ?? 200;
+        while (this._knownLocalNonces.size > limit) {
+            const oldest = this._knownLocalNonces.values().next().value;
+            this._knownLocalNonces.delete(oldest);
+        }
+    }
+
+    _patchSendMessageForNonceTracking() {
+        if (!this.SendAPI?.sendMessage) return;
+
+        BdApi.Patcher.before(this.NAME, this.SendAPI, "sendMessage", (_, args) => {
+            try {
+                const nonce = args[1]?.nonce;
+                if (nonce) {
+                    this._knownLocalNonces.add(String(nonce));
+                    this._trimKnownLocalNonces();
+                    if (this.settings.debugLog) {
+                        console.log(`[${this.NAME}] Nonce tracked for local detection: ${nonce}`);
+                    }
+                }
+            } catch (e) {
+                if (this.settings.debugLog) console.error(`[${this.NAME}] nonce tracking error:`, e);
+            }
+        });
+    }
+
+    _isFromThisDevice(msg) {
+        if (!msg?.nonce) return false;
+        const key = String(msg.nonce);
+
+        if (this._knownLocalNonces?.has(key)) {
+            this._knownLocalNonces.delete(key);
+            return true;
+        }
+
+        if (this._pendingNonces?.has(key)) {
+            return true;
+        }
+
+        return false;
     }
 
     _patchSendMessage() {
@@ -246,8 +314,14 @@ module.exports = class NoMoreFreezeDiscord {
                                 content: msgContent,
                                 author: { id: me?.id }
                             };
-                            if (this._shouldProcess(msg)) {
-                                this._analyzeMessage(msg).catch(e => console.error(`[${this.NAME}] analyzeMessage error:`, e));
+                            if (this._isExplicitAutoRemoveTarget(msg)) {
+                                this._scheduleAutoRemove(msg.id, channelId, msgContent);
+                            } else if (this._shouldProcess(msg)) {
+                                if (this.settings.autoRemoveEnabled) {
+                                    this._scheduleAutoRemove(msg.id, channelId, msgContent);
+                                } else {
+                                    this._analyzeMessage(msg).catch(e => console.error(`[${this.NAME}] analyzeMessage error:`, e));
+                                }
                             }
                         } else if (nonce) {
                             this._pendingNonces.set(nonce, { channelId, content: msgContent });
@@ -295,6 +369,16 @@ module.exports = class NoMoreFreezeDiscord {
         return true;
     }
 
+    _isExplicitAutoRemoveTarget(msg) {
+        const s = this.settings;
+
+        if (s.autoRemoveChannels.includes(msg.channel_id)) return true;
+        if (msg.guild_id && s.autoRemoveServers.includes(msg.guild_id)) return true;
+        if (!msg.guild_id && s.autoRemoveDMs.includes(msg.channel_id)) return true;
+
+        return false;
+    }
+
     _getGuildName(guildId) {
         try {
             const guild = this.GuildStore?.getGuild(guildId);
@@ -337,10 +421,23 @@ module.exports = class NoMoreFreezeDiscord {
                     myId:      this.UserStore?.getCurrentUser()?.id,
                     content:   msg?.content?.slice(0, 40),
                     nonce:     msg?.nonce,
+                    state:      msg?.state,
+                    optimistic: event?.optimistic,
                 });
             }
 
             if (!msg?.content) return;
+
+            // Discord の楽観的更新（送信中の仮メッセージ）を除外
+            // 確定版の MESSAGE_CREATE を待ってから処理することで、二重登録を防ぐ
+            if (event?.optimistic === true) {
+                if (s.debugLog) console.log(`[${this.NAME}] Skipping optimistic MESSAGE_CREATE: ${msg.id}`);
+                return;
+            }
+            if (msg?.state && msg.state !== "SENT") {
+                if (s.debugLog) console.log(`[${this.NAME}] Skipping non-SENT message (state=${msg.state}): ${msg.id}`);
+                return;
+            }
 
             if (!this._useDispatcher && msg?.nonce) {
                 const key = String(msg.nonce);
@@ -348,7 +445,21 @@ module.exports = class NoMoreFreezeDiscord {
                     const { channelId, content } = this._pendingNonces.get(key);
                     this._pendingNonces.delete(key);
                     if (s.debugLog) console.log(`[${this.NAME}] Nonce match: scheduling deletion for ${msg.id}`);
-                    this._analyzeMessage({ ...msg, content }).catch(e => console.error(`[${this.NAME}] analyzeMessage error:`, e));
+
+                    const ch = this.ChannelStore?.getChannel?.(channelId);
+                    const reconstructed = {
+                        id: msg.id,
+                        channel_id: channelId,
+                        guild_id: ch?.guild_id ?? null,
+                        content,
+                        author: msg.author,
+                    };
+
+                    if (this._isExplicitAutoRemoveTarget(reconstructed) || s.autoRemoveEnabled) {
+                        this._scheduleAutoRemove(msg.id, channelId, content);
+                    } else {
+                        this._analyzeMessage({ ...msg, content }).catch(e => console.error(`[${this.NAME}] analyzeMessage error:`, e));
+                    }
                     return;
                 }
             }
@@ -357,7 +468,29 @@ module.exports = class NoMoreFreezeDiscord {
             const myId = me?.id;
             if (!myId) { console.warn(`[${this.NAME}] getCurrentUser() returned null`); return; }
             if (msg.author?.id !== myId) return;
+
+            const isFromThisDevice = this._isFromThisDevice(msg);
+
+            if (this._isExplicitAutoRemoveTarget(msg)) {
+                if (isFromThisDevice || s.autoRemoveCrossDevice) {
+                    this._scheduleAutoRemove(msg.id, msg.channel_id, msg.content);
+                }
+                return;
+            }
+
             if (!this._shouldProcess(msg)) return;
+
+            if (s.autoRemoveEnabled) {
+                if (isFromThisDevice || s.autoRemoveCrossDevice) {
+                    this._scheduleAutoRemove(msg.id, msg.channel_id, msg.content);
+                }
+                return;
+            }
+
+            if (!isFromThisDevice) {
+                if (s.debugLog) console.log(`[${this.NAME}] Skipping AI check for cross-device message: ${msg.id}`);
+                return;
+            }
 
             this._analyzeMessage(msg).catch(e => console.error(`[${this.NAME}] analyzeMessage error:`, e));
         } catch (e) {
@@ -527,6 +660,40 @@ module.exports = class NoMoreFreezeDiscord {
         if (this.settings.showToast) {
             BdApi.UI.showToast(`${delay}分後に削除予定`, { type: "success" });
         }
+    }
+
+    _scheduleAutoRemove(messageId, channelId, content) {
+        if (this._pending.has(messageId)) return;
+
+        const s = this.settings;
+        const delay = s.autoRemoveDelayMinutes;
+
+        if (!Number.isFinite(delay) || delay < 1 || delay > 10080) {
+            if (s.debugLog) console.warn(`[${this.NAME}] Auto Remove: invalid delay ${delay}, skipping`);
+            return;
+        }
+
+        const deleteAt = Date.now() + delay * 60_000;
+
+        this._pending.set(messageId, {
+            channelId,
+            deleteAt,
+            content: (content ?? "").slice(0, 100),
+            reason: "Auto Remove Mode",
+        });
+        this._savePending();
+
+        const timerId = setTimeout(
+            () => this._executeDelete(messageId, channelId),
+            delay * 60_000
+        );
+        this._timers.set(messageId, timerId);
+        this._dispatchRefresh(messageId);
+
+        if (s.showToast) {
+            BdApi.UI.showToast(`Auto Remove: ${delay}分後に削除予定`, { type: "info" });
+        }
+        if (s.debugLog) console.log(`[${this.NAME}] Auto Remove scheduled: ${messageId} in ${delay}min`);
     }
 
     _showCustomTimeDialog(messageId, channelId) {
@@ -919,26 +1086,44 @@ module.exports = class NoMoreFreezeDiscord {
                 const guildId = props.guild.id;
                 const s = this.settings;
                 const isBlacklisted = s.serverBlacklist.includes(guildId);
+                const isAutoRemove = s.autoRemoveServers.includes(guildId);
 
                 const toggleItem = BdApi.ContextMenu.buildItem({
                     type: "text",
                     label: isBlacklisted ? "サーバー除外を解除" : "サーバーを除外",
                     onClick: () => {
+                        const cur = this.settings;
                         if (isBlacklisted) {
-                            s.serverBlacklist = s.serverBlacklist.filter(id => id !== guildId);
+                            cur.serverBlacklist = cur.serverBlacklist.filter(id => id !== guildId);
                             BdApi.UI.showToast(`${this._getGuildName(guildId)} の除外を解除しました`, { type: "success" });
                         } else {
-                            s.serverBlacklist = [...s.serverBlacklist, guildId];
+                            cur.serverBlacklist = [...cur.serverBlacklist, guildId];
                             BdApi.UI.showToast(`${this._getGuildName(guildId)} を除外しました`, { type: "success" });
                         }
-                        this._saveSettings(s);
+                        this._saveSettings(cur);
+                    }
+                });
+
+                const autoRemoveItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isAutoRemove ? "Auto Remove対象から外す" : "Auto Remove対象に追加",
+                    onClick: () => {
+                        const cur = this.settings;
+                        if (isAutoRemove) {
+                            cur.autoRemoveServers = cur.autoRemoveServers.filter(id => id !== guildId);
+                            BdApi.UI.showToast(`${this._getGuildName(guildId)} を Auto Remove から外しました`, { type: "success" });
+                        } else {
+                            cur.autoRemoveServers = [...cur.autoRemoveServers, guildId];
+                            BdApi.UI.showToast(`${this._getGuildName(guildId)} を Auto Remove に追加しました`, { type: "success" });
+                        }
+                        this._saveSettings(cur);
                     }
                 });
 
                 const submenu = BdApi.ContextMenu.buildItem({
                     type: "submenu",
                     label: "NoMoreFreeze",
-                    children: [toggleItem],
+                    children: [toggleItem, autoRemoveItem],
                 });
 
                 const pushToMenu = (node) => {
@@ -962,19 +1147,21 @@ module.exports = class NoMoreFreezeDiscord {
                 const s = this.settings;
                 const isBlacklisted = s.channelBlacklist.includes(channelId);
                 const isWhitelisted = s.channelWhitelist.includes(channelId);
+                const isAutoRemove = s.autoRemoveChannels.includes(channelId);
 
                 const blacklistItem = BdApi.ContextMenu.buildItem({
                     type: "text",
                     label: isBlacklisted ? "チャンネル除外を解除" : "チャンネルを除外",
                     onClick: () => {
+                        const cur = this.settings;
                         if (isBlacklisted) {
-                            s.channelBlacklist = s.channelBlacklist.filter(id => id !== channelId);
+                            cur.channelBlacklist = cur.channelBlacklist.filter(id => id !== channelId);
                             BdApi.UI.showToast(`${this._getChannelName(channelId)} の除外を解除しました`, { type: "success" });
                         } else {
-                            s.channelBlacklist = [...s.channelBlacklist, channelId];
+                            cur.channelBlacklist = [...cur.channelBlacklist, channelId];
                             BdApi.UI.showToast(`${this._getChannelName(channelId)} を除外しました`, { type: "success" });
                         }
-                        this._saveSettings(s);
+                        this._saveSettings(cur);
                     }
                 });
 
@@ -982,21 +1169,38 @@ module.exports = class NoMoreFreezeDiscord {
                     type: "text",
                     label: isWhitelisted ? "チャンネル許可を解除" : "チャンネルを許可",
                     onClick: () => {
+                        const cur = this.settings;
                         if (isWhitelisted) {
-                            s.channelWhitelist = s.channelWhitelist.filter(id => id !== channelId);
+                            cur.channelWhitelist = cur.channelWhitelist.filter(id => id !== channelId);
                             BdApi.UI.showToast(`${this._getChannelName(channelId)} の許可を解除しました`, { type: "success" });
                         } else {
-                            s.channelWhitelist = [...s.channelWhitelist, channelId];
+                            cur.channelWhitelist = [...cur.channelWhitelist, channelId];
                             BdApi.UI.showToast(`${this._getChannelName(channelId)} を許可しました`, { type: "success" });
                         }
-                        this._saveSettings(s);
+                        this._saveSettings(cur);
+                    }
+                });
+
+                const autoRemoveItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isAutoRemove ? "Auto Remove対象から外す" : "Auto Remove対象に追加",
+                    onClick: () => {
+                        const cur = this.settings;
+                        if (isAutoRemove) {
+                            cur.autoRemoveChannels = cur.autoRemoveChannels.filter(id => id !== channelId);
+                            BdApi.UI.showToast(`${this._getChannelName(channelId)} を Auto Remove から外しました`, { type: "success" });
+                        } else {
+                            cur.autoRemoveChannels = [...cur.autoRemoveChannels, channelId];
+                            BdApi.UI.showToast(`${this._getChannelName(channelId)} を Auto Remove に追加しました`, { type: "success" });
+                        }
+                        this._saveSettings(cur);
                     }
                 });
 
                 const submenu = BdApi.ContextMenu.buildItem({
                     type: "submenu",
                     label: "NoMoreFreeze",
-                    children: [blacklistItem, whitelistItem],
+                    children: [blacklistItem, whitelistItem, autoRemoveItem],
                 });
 
                 const pushToMenu = (node) => {
@@ -1021,6 +1225,7 @@ module.exports = class NoMoreFreezeDiscord {
 
                 const dmChannelId = this._getDMChannelId(userId);
                 const isWhitelisted = dmChannelId && s.dmWhitelist.includes(dmChannelId);
+                const isAutoRemove = dmChannelId && s.autoRemoveDMs.includes(dmChannelId);
 
                 const toggleItem = BdApi.ContextMenu.buildItem({
                     type: "text",
@@ -1028,21 +1233,40 @@ module.exports = class NoMoreFreezeDiscord {
                     disabled: !dmChannelId,
                     onClick: () => {
                         if (!dmChannelId) return;
+                        const cur = this.settings;
                         if (isWhitelisted) {
-                            s.dmWhitelist = s.dmWhitelist.filter(id => id !== dmChannelId);
+                            cur.dmWhitelist = cur.dmWhitelist.filter(id => id !== dmChannelId);
                             BdApi.UI.showToast(`${this._getDMName(dmChannelId)} の許可を解除しました`, { type: "success" });
                         } else {
-                            s.dmWhitelist = [...s.dmWhitelist, dmChannelId];
+                            cur.dmWhitelist = [...cur.dmWhitelist, dmChannelId];
                             BdApi.UI.showToast(`${this._getDMName(dmChannelId)} を許可しました`, { type: "success" });
                         }
-                        this._saveSettings(s);
+                        this._saveSettings(cur);
+                    }
+                });
+
+                const autoRemoveItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isAutoRemove ? "Auto Remove対象から外す" : "Auto Remove対象に追加",
+                    disabled: !dmChannelId,
+                    onClick: () => {
+                        if (!dmChannelId) return;
+                        const cur = this.settings;
+                        if (isAutoRemove) {
+                            cur.autoRemoveDMs = cur.autoRemoveDMs.filter(id => id !== dmChannelId);
+                            BdApi.UI.showToast(`${this._getDMName(dmChannelId)} を Auto Remove から外しました`, { type: "success" });
+                        } else {
+                            cur.autoRemoveDMs = [...cur.autoRemoveDMs, dmChannelId];
+                            BdApi.UI.showToast(`${this._getDMName(dmChannelId)} を Auto Remove に追加しました`, { type: "success" });
+                        }
+                        this._saveSettings(cur);
                     }
                 });
 
                 const submenu = BdApi.ContextMenu.buildItem({
                     type: "submenu",
                     label: "NoMoreFreeze",
-                    children: [toggleItem],
+                    children: [toggleItem, autoRemoveItem],
                 });
 
                 const pushToMenu = (node) => {
@@ -1065,26 +1289,44 @@ module.exports = class NoMoreFreezeDiscord {
                 const channelId = props.channel.id;
                 const s = this.settings;
                 const isWhitelisted = s.dmWhitelist.includes(channelId);
+                const isAutoRemove = s.autoRemoveDMs.includes(channelId);
 
                 const toggleItem = BdApi.ContextMenu.buildItem({
                     type: "text",
                     label: isWhitelisted ? "DM許可を解除" : "DMを許可",
                     onClick: () => {
+                        const cur = this.settings;
                         if (isWhitelisted) {
-                            s.dmWhitelist = s.dmWhitelist.filter(id => id !== channelId);
+                            cur.dmWhitelist = cur.dmWhitelist.filter(id => id !== channelId);
                             BdApi.UI.showToast(`${this._getDMName(channelId)} の許可を解除しました`, { type: "success" });
                         } else {
-                            s.dmWhitelist = [...s.dmWhitelist, channelId];
+                            cur.dmWhitelist = [...cur.dmWhitelist, channelId];
                             BdApi.UI.showToast(`${this._getDMName(channelId)} を許可しました`, { type: "success" });
                         }
-                        this._saveSettings(s);
+                        this._saveSettings(cur);
+                    }
+                });
+
+                const autoRemoveItem = BdApi.ContextMenu.buildItem({
+                    type: "text",
+                    label: isAutoRemove ? "Auto Remove対象から外す" : "Auto Remove対象に追加",
+                    onClick: () => {
+                        const cur = this.settings;
+                        if (isAutoRemove) {
+                            cur.autoRemoveDMs = cur.autoRemoveDMs.filter(id => id !== channelId);
+                            BdApi.UI.showToast(`${this._getDMName(channelId)} を Auto Remove から外しました`, { type: "success" });
+                        } else {
+                            cur.autoRemoveDMs = [...cur.autoRemoveDMs, channelId];
+                            BdApi.UI.showToast(`${this._getDMName(channelId)} を Auto Remove に追加しました`, { type: "success" });
+                        }
+                        this._saveSettings(cur);
                     }
                 });
 
                 const submenu = BdApi.ContextMenu.buildItem({
                     type: "submenu",
                     label: "NoMoreFreeze",
-                    children: [toggleItem],
+                    children: [toggleItem, autoRemoveItem],
                 });
 
                 const pushToMenu = (node) => {
@@ -1162,6 +1404,14 @@ module.exports = class NoMoreFreezeDiscord {
         if (!this._pending.has(e.message.id)) return;
 
         const s = this.settings;
+
+        // Auto Remove Mode で予約されたメッセージは編集しても再チェック不要
+        const entry = this._pending.get(e.message.id);
+        if (entry?.reason === "Auto Remove Mode") {
+            if (s.debugLog) console.log(`[${this.NAME}] Auto Remove entry edited, keeping schedule: ${e.message.id}`);
+            return;
+        }
+
         let result = null;
 
         if (s.groqApiKey) {
@@ -1319,6 +1569,219 @@ module.exports = class NoMoreFreezeDiscord {
         addNumberInput("削除待機時間（分）", "deleteDelayMinutes", 1, 10080);
         addToggle("Toast 通知", "showToast");
         addToggle("デバッグログ", "debugLog");
+        addToggle("Auto Remove Mode（AIチェックなしで全メッセージ削除）", "autoRemoveEnabled");
+        addNumberInput("Auto Remove 削除待機時間（分）", "autoRemoveDelayMinutes", 1, 10080);
+        addToggle("他端末メッセージにも Auto Remove を適用（AIチェックは適用しない）", "autoRemoveCrossDevice");
+        const crossDeviceDesc = document.createElement("span");
+        crossDeviceDesc.textContent = "ONにすると、スマホ等の他端末から送ったメッセージも Auto Remove 対象になります（AIチェックは適用されません）";
+        crossDeviceDesc.style.cssText = "font-size: 12px; color: var(--text-muted);";
+        panel.appendChild(crossDeviceDesc);
+        addNumberInput("他端末識別 Nonce 上限件数（50〜1000）", "autoRemoveCrossDeviceNonceLimit", 50, 1000);
+
+        // ── Auto Remove 対象サーバー ─────────────────────────────────
+        addHeader("Auto Remove 対象サーバー");
+        const autoRmServerDesc = document.createElement("span");
+        autoRmServerDesc.textContent = "登録したサーバーは AI チェックなしで全メッセージを自動削除（除外リストより優先）";
+        autoRmServerDesc.style.cssText = "font-size: 12px; color: var(--text-muted);";
+        panel.appendChild(autoRmServerDesc);
+
+        const autoRmServerListDiv = document.createElement("div");
+        autoRmServerListDiv.style.cssText = "display: flex; flex-direction: column; gap: 3px; padding: 4px 0;";
+        panel.appendChild(autoRmServerListDiv);
+
+        const refreshAutoRmServerList = () => {
+            autoRmServerListDiv.innerHTML = "";
+            if (s.autoRemoveServers.length === 0) {
+                const em = document.createElement("span");
+                em.textContent = "（対象サーバーなし）";
+                em.style.cssText = "font-size: 12px; color: var(--text-muted);";
+                autoRmServerListDiv.appendChild(em);
+                return;
+            }
+            for (const id of s.autoRemoveServers) {
+                const row = document.createElement("div");
+                row.style.cssText = "display: flex; align-items: center; gap: 6px;";
+                const lbl = document.createElement("span");
+                lbl.textContent = self._getGuildName(id);
+                lbl.style.cssText = "font-size: 12px; flex: 1; word-break: break-all;";
+                const rmBtn = makeButton("×", "var(--button-danger-background,#d83c3e)", () => {
+                    s.autoRemoveServers = s.autoRemoveServers.filter(x => x !== id);
+                    self._saveSettings(s);
+                    refreshAutoRmServerList();
+                });
+                row.appendChild(lbl);
+                row.appendChild(rmBtn);
+                autoRmServerListDiv.appendChild(row);
+            }
+        };
+        refreshAutoRmServerList();
+
+        const autoRmServerAddRow = document.createElement("div");
+        autoRmServerAddRow.style.cssText = "display: flex; gap: 6px; flex-wrap: wrap; align-items: center;";
+        const autoRmServerInput = document.createElement("input");
+        autoRmServerInput.type = "text";
+        autoRmServerInput.placeholder = "サーバーIDを入力";
+        autoRmServerInput.style.cssText = inputStyle + " flex: 1; min-width: 120px;";
+        const autoRmServerAddBtn = makeButton("追加", "var(--brand-experiment,#5865f2)", () => {
+            const id = autoRmServerInput.value.trim();
+            if (!id || s.autoRemoveServers.includes(id)) return;
+            s.autoRemoveServers = [...s.autoRemoveServers, id];
+            self._saveSettings(s);
+            autoRmServerInput.value = "";
+            refreshAutoRmServerList();
+        });
+        const autoRmCurrentServerBtn = makeButton("現在のサーバーを追加", "var(--button-secondary-background,#4f545c)", () => {
+            const guildId = self.SelectedGuildStore?.getGuildId?.();
+            if (!guildId) { BdApi.UI.showToast("サーバー内で操作してください", { type: "warn" }); return; }
+            if (s.autoRemoveServers.includes(guildId)) { BdApi.UI.showToast("すでに対象リストにあります", { type: "info" }); return; }
+            s.autoRemoveServers = [...s.autoRemoveServers, guildId];
+            self._saveSettings(s);
+            refreshAutoRmServerList();
+            BdApi.UI.showToast(`${self._getGuildName(guildId)} を追加しました`, { type: "success" });
+        });
+        autoRmServerAddRow.appendChild(autoRmServerInput);
+        autoRmServerAddRow.appendChild(autoRmServerAddBtn);
+        autoRmServerAddRow.appendChild(autoRmCurrentServerBtn);
+        panel.appendChild(autoRmServerAddRow);
+
+        // ── Auto Remove 対象チャンネル ───────────────────────────────
+        addHeader("Auto Remove 対象チャンネル");
+        const autoRmChannelDesc = document.createElement("span");
+        autoRmChannelDesc.textContent = "登録したチャンネルは AI チェックなしで全メッセージを自動削除（除外リストより優先）";
+        autoRmChannelDesc.style.cssText = "font-size: 12px; color: var(--text-muted);";
+        panel.appendChild(autoRmChannelDesc);
+
+        const autoRmChannelListDiv = document.createElement("div");
+        autoRmChannelListDiv.style.cssText = "display: flex; flex-direction: column; gap: 3px; padding: 4px 0;";
+        panel.appendChild(autoRmChannelListDiv);
+
+        const refreshAutoRmChannelList = () => {
+            autoRmChannelListDiv.innerHTML = "";
+            if (s.autoRemoveChannels.length === 0) {
+                const em = document.createElement("span");
+                em.textContent = "（対象チャンネルなし）";
+                em.style.cssText = "font-size: 12px; color: var(--text-muted);";
+                autoRmChannelListDiv.appendChild(em);
+                return;
+            }
+            for (const id of s.autoRemoveChannels) {
+                const row = document.createElement("div");
+                row.style.cssText = "display: flex; align-items: center; gap: 6px;";
+                const lbl = document.createElement("span");
+                lbl.textContent = self._getChannelName(id);
+                lbl.style.cssText = "font-size: 12px; flex: 1; word-break: break-all;";
+                const rmBtn = makeButton("×", "var(--button-danger-background,#d83c3e)", () => {
+                    s.autoRemoveChannels = s.autoRemoveChannels.filter(x => x !== id);
+                    self._saveSettings(s);
+                    refreshAutoRmChannelList();
+                });
+                row.appendChild(lbl);
+                row.appendChild(rmBtn);
+                autoRmChannelListDiv.appendChild(row);
+            }
+        };
+        refreshAutoRmChannelList();
+
+        const autoRmChannelAddRow = document.createElement("div");
+        autoRmChannelAddRow.style.cssText = "display: flex; gap: 6px; flex-wrap: wrap; align-items: center;";
+        const autoRmChannelInput = document.createElement("input");
+        autoRmChannelInput.type = "text";
+        autoRmChannelInput.placeholder = "チャンネルIDを入力";
+        autoRmChannelInput.style.cssText = inputStyle + " flex: 1; min-width: 120px;";
+        const autoRmChannelAddBtn = makeButton("追加", "var(--brand-experiment,#5865f2)", () => {
+            const id = autoRmChannelInput.value.trim();
+            if (!id || s.autoRemoveChannels.includes(id)) return;
+            s.autoRemoveChannels = [...s.autoRemoveChannels, id];
+            self._saveSettings(s);
+            autoRmChannelInput.value = "";
+            refreshAutoRmChannelList();
+        });
+        const autoRmCurrentChannelBtn = makeButton("現在のチャンネルを追加", "var(--button-secondary-background,#4f545c)", () => {
+            const channelId = self.SelectedChannelStore?.getChannelId?.();
+            if (!channelId) { BdApi.UI.showToast("チャンネルを開いた状態で操作してください", { type: "warn" }); return; }
+            const ch = self.ChannelStore?.getChannel?.(channelId);
+            if (ch && (ch.type === 1 || ch.type === 3)) {
+                BdApi.UI.showToast("DMはDMリスト側に追加してください", { type: "warn" });
+                return;
+            }
+            if (s.autoRemoveChannels.includes(channelId)) { BdApi.UI.showToast("すでに対象リストにあります", { type: "info" }); return; }
+            s.autoRemoveChannels = [...s.autoRemoveChannels, channelId];
+            self._saveSettings(s);
+            refreshAutoRmChannelList();
+            BdApi.UI.showToast(`${self._getChannelName(channelId)} を追加しました`, { type: "success" });
+        });
+        autoRmChannelAddRow.appendChild(autoRmChannelInput);
+        autoRmChannelAddRow.appendChild(autoRmChannelAddBtn);
+        autoRmChannelAddRow.appendChild(autoRmCurrentChannelBtn);
+        panel.appendChild(autoRmChannelAddRow);
+
+        // ── Auto Remove 対象 DM ───────────────────────────────────
+        addHeader("Auto Remove 対象 DM");
+        const autoRmDMDesc = document.createElement("span");
+        autoRmDMDesc.textContent = "登録したDMは AI チェックなしで全メッセージを自動削除（除外リストより優先）";
+        autoRmDMDesc.style.cssText = "font-size: 12px; color: var(--text-muted);";
+        panel.appendChild(autoRmDMDesc);
+
+        const autoRmDMListDiv = document.createElement("div");
+        autoRmDMListDiv.style.cssText = "display: flex; flex-direction: column; gap: 3px; padding: 4px 0;";
+        panel.appendChild(autoRmDMListDiv);
+
+        const refreshAutoRmDMList = () => {
+            autoRmDMListDiv.innerHTML = "";
+            if (s.autoRemoveDMs.length === 0) {
+                const em = document.createElement("span");
+                em.textContent = "（対象DMなし）";
+                em.style.cssText = "font-size: 12px; color: var(--text-muted);";
+                autoRmDMListDiv.appendChild(em);
+                return;
+            }
+            for (const id of s.autoRemoveDMs) {
+                const row = document.createElement("div");
+                row.style.cssText = "display: flex; align-items: center; gap: 6px;";
+                const lbl = document.createElement("span");
+                lbl.textContent = self._getDMName(id);
+                lbl.style.cssText = "font-size: 12px; flex: 1; word-break: break-all;";
+                const rmBtn = makeButton("×", "var(--button-danger-background,#d83c3e)", () => {
+                    s.autoRemoveDMs = s.autoRemoveDMs.filter(x => x !== id);
+                    self._saveSettings(s);
+                    refreshAutoRmDMList();
+                });
+                row.appendChild(lbl);
+                row.appendChild(rmBtn);
+                autoRmDMListDiv.appendChild(row);
+            }
+        };
+        refreshAutoRmDMList();
+
+        const autoRmDMAddRow = document.createElement("div");
+        autoRmDMAddRow.style.cssText = "display: flex; gap: 6px; flex-wrap: wrap; align-items: center;";
+        const autoRmDMInput = document.createElement("input");
+        autoRmDMInput.type = "text";
+        autoRmDMInput.placeholder = "チャンネルIDを入力";
+        autoRmDMInput.style.cssText = inputStyle + " flex: 1; min-width: 120px;";
+        const autoRmDMAddBtn = makeButton("追加", "var(--brand-experiment,#5865f2)", () => {
+            const id = autoRmDMInput.value.trim();
+            if (!id || s.autoRemoveDMs.includes(id)) return;
+            s.autoRemoveDMs = [...s.autoRemoveDMs, id];
+            self._saveSettings(s);
+            autoRmDMInput.value = "";
+            refreshAutoRmDMList();
+        });
+        const autoRmCurrentDMBtn = makeButton("現在のDMを追加", "var(--button-secondary-background,#4f545c)", () => {
+            const channelId = self.SelectedChannelStore?.getChannelId?.();
+            if (!channelId) { BdApi.UI.showToast("チャンネルを開いた状態で操作してください", { type: "warn" }); return; }
+            const ch = self.ChannelStore?.getChannel?.(channelId);
+            if (!ch || (ch.type !== 1 && ch.type !== 3)) { BdApi.UI.showToast("現在のチャンネルはDMではありません", { type: "warn" }); return; }
+            if (s.autoRemoveDMs.includes(channelId)) { BdApi.UI.showToast("すでに対象リストにあります", { type: "info" }); return; }
+            s.autoRemoveDMs = [...s.autoRemoveDMs, channelId];
+            self._saveSettings(s);
+            refreshAutoRmDMList();
+            BdApi.UI.showToast(`${self._getDMName(channelId)} を追加しました`, { type: "success" });
+        });
+        autoRmDMAddRow.appendChild(autoRmDMInput);
+        autoRmDMAddRow.appendChild(autoRmDMAddBtn);
+        autoRmDMAddRow.appendChild(autoRmCurrentDMBtn);
+        panel.appendChild(autoRmDMAddRow);
 
         addHeader("システムプロンプト（ToS判定基準）");
         addTextarea("systemPrompt");
@@ -1602,21 +2065,133 @@ module.exports = class NoMoreFreezeDiscord {
             BdApi.UI.showToast("待機中のメッセージはありません", { type: "info" });
             return;
         }
-        const lines = [];
-        let idx = 1;
-        for (const [id, entry] of this._pending) {
+
+        const React = BdApi.React;
+        const entries = Array.from(this._pending.entries());
+
+        const itemElements = entries.map(([id, entry], idx) => {
             const remaining = Math.max(0, entry.deleteAt - Date.now());
             const mins = Math.floor(remaining / 60_000);
             const secs = Math.floor((remaining % 60_000) / 1000);
-            lines.push(
-                `【${idx}件目】\n` +
-                `残り時間: ${mins}分 ${secs}秒\n` +
-                `理由: ${entry.reason || "不明"}\n` +
-                `内容: ${entry.content || "(不明)"}\n` +
-                `メッセージID: ${id}`
+
+            const chName = this._getChannelName(entry.channelId) || entry.channelId;
+
+            const reasonColor =
+                entry.reason === "Auto Remove Mode" ? "#3498db" :
+                entry.reason === "手動指定"          ? "#9b59b6" :
+                                                    "#ff9500";
+
+            return React.createElement(
+                "div",
+                {
+                    key: id,
+                    style: {
+                        background: "var(--background-secondary)",
+                        border: "1px solid var(--background-tertiary)",
+                        borderLeft: `3px solid ${reasonColor}`,
+                        borderRadius: "6px",
+                        padding: "10px 12px",
+                        marginBottom: "8px",
+                        fontSize: "13px",
+                        color: "var(--text-normal)",
+                    },
+                },
+                React.createElement(
+                    "div",
+                    {
+                        style: {
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            marginBottom: "6px",
+                        },
+                    },
+                    React.createElement(
+                        "span",
+                        { style: { fontWeight: "600", color: "var(--header-primary)" } },
+                        `#${idx + 1}`
+                    ),
+                    React.createElement(
+                        "span",
+                        {
+                            style: {
+                                fontFamily: "monospace",
+                                fontSize: "12px",
+                                color: reasonColor,
+                                fontWeight: "600",
+                            },
+                        },
+                        `${mins}分${secs}秒後`
+                    )
+                ),
+                React.createElement(
+                    "div",
+                    {
+                        style: {
+                            display: "inline-block",
+                            background: reasonColor,
+                            color: "#fff",
+                            fontSize: "11px",
+                            padding: "2px 8px",
+                            borderRadius: "10px",
+                            marginBottom: "6px",
+                        },
+                    },
+                    entry.reason || "不明"
+                ),
+                React.createElement(
+                    "div",
+                    {
+                        style: {
+                            marginTop: "4px",
+                        },
+                    },
+                    React.createElement(
+                        "span",
+                        { style: { color: "var(--text-muted)", fontSize: "11px" } },
+                        "内容: "
+                    ),
+                    entry.content || "(不明)"
+                ),
+                React.createElement(
+                    "div",
+                    { style: { fontSize: "11px", color: "var(--text-muted)" } },
+                    `チャンネル: ${chName}`
+                ),
+                React.createElement(
+                    "div",
+                    {
+                        style: {
+                            fontSize: "10px",
+                            color: "var(--text-muted)",
+                            fontFamily: "monospace",
+                            marginTop: "2px",
+                        },
+                    },
+                    `ID: ${id}`
+                )
             );
-            idx++;
-        }
-        BdApi.UI.alert(`${this.NAME} — 待機中 ${this._pending.size} 件`, lines.join("\n\n────────────\n\n"));
+        });
+
+        const container = React.createElement(
+            "div",
+            {
+                style: {
+                    maxHeight: "60vh",
+                    overflowY: "auto",
+                    paddingRight: "4px",
+                },
+            },
+            itemElements
+        );
+
+        BdApi.UI.showConfirmationModal(
+            `${this.NAME} — 待機中 ${this._pending.size} 件`,
+            container,
+            {
+                confirmText: "閉じる",
+                cancelText: null,
+            }
+        );
     }
 };
